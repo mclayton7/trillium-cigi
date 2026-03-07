@@ -1,0 +1,25 @@
+# CIGI Trillium Gimbal Simulator — Runtime Configuration
+# All angles in degrees; rates in deg/s or deg/s².
+# Lines starting with '#' or '[section]' headers are ignored.
+
+[network]
+port = 8008
+
+[kinematics]
+max_slew_rate_deg_s = 60.0
+max_accel_deg_s2    = 300.0
+pan_limit_deg       = 170.0
+tilt_min_deg        = -110.0
+tilt_max_deg        = 30.0
+
+[camera]
+# Wide (zoom=0) and narrow (zoom=1) field of view.
+hfov_wide_deg   = 30.0
+vfov_wide_deg   = 22.5
+hfov_narrow_deg = 3.0
+vfov_narrow_deg = 2.25
+
+[vibration]
+jitter_freq_hz      = 10.0
+jitter_amplitude_deg = 0.05
+noise_floor_deg     = 0.01
