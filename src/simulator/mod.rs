@@ -16,7 +16,7 @@
 
 use std::f32::consts::PI;
 
-use crate::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse, SensorResponse, StartOfFrame};
+use crate::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse, StartOfFrame};
 use crate::config::{Config, camera_fov};
 use crate::faults::{FaultState, lcg_noise_f32};
 use crate::geo;
@@ -24,6 +24,7 @@ use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
 
 // ─────────────────────────────────────────── constants (kept for tests) ──
 
+#[allow(dead_code)]
 /// Default maximum slew rate (rad/s) = 60 °/s.  Matches Config::default().
 pub const MAX_SLEW_RATE: f32 = 1.047_198; // 60°/s in rad/s
 
@@ -597,11 +598,6 @@ impl GimbalSimulator {
         pkt
     }
 
-    /// Build a CIGI SensorResponse from current state.
-    pub fn to_sensor_response(&self) -> SensorResponse {
-        crate::convert::to_cigi::telemetry_to_sensor_response(&self.to_telemetry(), 0, 0)
-    }
-
     /// Build a CIGI SensorExtendedResponse from current state.
     ///
     /// `entity_lat/lon/alt` fields are populated with the WGS84 look-point
@@ -738,7 +734,7 @@ mod tests {
         for _ in 0..100 {
             sim.tick(0.1);
         }
-        let sr = sim.to_sensor_response();
+        let sr = sim.to_sensor_extended_response();
         assert!(sr.gate_x_pos.abs() > 0.0 || sr.gate_y_pos.abs() < 1e-3);
     }
 

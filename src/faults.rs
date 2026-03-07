@@ -35,6 +35,7 @@ pub struct FaultState {
     pub(crate) uptime_secs: f32,
 }
 
+#[allow(dead_code)]
 impl FaultState {
     /// Advance internal time by `dt` seconds.
     pub fn tick(&mut self, dt: f32) {
@@ -49,7 +50,9 @@ impl FaultState {
     pub fn clear_motor_fault(&mut self)  { self.motor_fault = false; }
     pub fn inject_imu_dropout(&mut self) { self.imu_dropout = true; }
     pub fn clear_imu_dropout(&mut self)  { self.imu_dropout = false; }
+    #[allow(dead_code)]
     pub fn inject_thermal(&mut self)     { self.thermal_warning = true; }
+    #[allow(dead_code)]
     pub fn clear_thermal(&mut self)      { self.thermal_warning = false; }
     pub fn clear_all(&mut self)          {
         self.gps_loss = false;

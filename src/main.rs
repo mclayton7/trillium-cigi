@@ -110,7 +110,7 @@ async fn main() {
                             sim.ig_mode = igc.ig_mode;
                             sim.host_frame_ctr = igc.frame_ctr;
                         }
-                        CigiPacket::Unknown(..) => {}
+                        CigiPacket::Unknown => {}
                     }
                 }
             }

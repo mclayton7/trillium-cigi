@@ -12,7 +12,7 @@ pub enum CigiPacket {
     IgControl(IgControl),
     EntityControl(EntityControl),
     SensorControl(SensorControl),
-    Unknown(u8, Vec<u8>),
+    Unknown,
 }
 
 /// CIGI v3.3 UDP network server.
@@ -48,10 +48,6 @@ impl CigiServer {
         Ok(())
     }
 
-    /// The remote address that most recently sent us a packet.
-    pub fn host_addr(&self) -> Option<SocketAddr> {
-        self.host_addr
-    }
 }
 
 /// Parse a single CIGI datagram (may contain multiple packets).
@@ -73,7 +69,7 @@ fn parse_cigi_datagram(data: &[u8]) -> Vec<CigiPacket> {
             IgControl::TYPE_ID => IgControl::decode(pkt_data).map(CigiPacket::IgControl),
             EntityControl::TYPE_ID => EntityControl::decode(pkt_data).map(CigiPacket::EntityControl),
             SensorControl::TYPE_ID => SensorControl::decode(pkt_data).map(CigiPacket::SensorControl),
-            _ => Some(CigiPacket::Unknown(type_id, pkt_data.to_vec())),
+            _ => Some(CigiPacket::Unknown),
         };
 
         if let Some(p) = pkt {

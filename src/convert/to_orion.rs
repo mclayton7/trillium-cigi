@@ -1,7 +1,7 @@
 // Convert CIGI commands → Orion packet types.
 
-use crate::cigi::messages::{EntityControl, SensorControl};
-use crate::orion::{GeopointCmdPacket, GpsDataPacket, OrionCmdPacket, OrionMode};
+use crate::cigi::messages::SensorControl;
+use crate::orion::{OrionCmdPacket, OrionMode};
 
 /// Map CIGI `SensorControl` → `OrionCmdPacket` (ORION_PKT_CMD).
 ///
@@ -55,29 +55,3 @@ pub fn sensor_control_to_orion_cmd(sc: &SensorControl) -> OrionCmdPacket {
     pkt
 }
 
-/// Map CIGI `EntityControl` (platform position) → `GpsDataPacket`.
-///
-/// CIGI uses degrees for lat/lon; Orion stores lat/lon in radians internally.
-pub fn entity_control_to_gps_data(ec: &EntityControl) -> GpsDataPacket {
-    use std::f64::consts::PI;
-    let mut pkt = GpsDataPacket::default();
-    pkt.latitude = ec.lat_or_x * PI / 180.0;
-    pkt.longitude = ec.lon_or_y * PI / 180.0;
-    pkt.altitude = ec.alt_or_z;
-    pkt
-}
-
-/// Build a `GeopointCmdPacket` for geopoint mode.
-///
-/// `ac_coupling`/`noise` fields from `SensorControl` encode lat/lon as 0–1 fractions
-/// covering −90°…+90° and −180°…+180° respectively.
-pub fn sensor_control_to_geopoint_cmd(sc: &SensorControl) -> GeopointCmdPacket {
-    use std::f64::consts::PI;
-    let lat_deg = sc.ac_coupling as f64 * 180.0 - 90.0;
-    let lon_deg = sc.noise as f64 * 360.0 - 180.0;
-    let mut pkt = GeopointCmdPacket::default();
-    pkt.target_lat = lat_deg * PI / 180.0;
-    pkt.target_lon = lon_deg * PI / 180.0;
-    pkt.target_alt = 0.0;
-    pkt
-}

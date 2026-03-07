@@ -48,10 +48,6 @@ impl GimbalBridge {
         Ok(())
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.stream.is_some()
-    }
-
     /// If disconnected and the reconnect interval has elapsed, attempt to
     /// reconnect.  Silently does nothing if already connected or too soon.
     pub async fn try_reconnect(&mut self) {
