@@ -190,8 +190,14 @@ pub fn ned_velocity(
     if dt < 1e-9 {
         return [0.0; 3];
     }
+    let dlon = {
+        let raw = lon2 - lon1;
+        let pi2 = std::f64::consts::PI * 2.0;
+        ((raw + std::f64::consts::PI).rem_euclid(pi2)) - std::f64::consts::PI
+    };
+    let mid_lat = (lat1 + lat2) * 0.5;
     let dn = (lat2 - lat1) * RE / dt;
-    let de = (lon2 - lon1) * RE * lat2.cos() / dt;
+    let de = dlon * RE * mid_lat.cos() / dt;
     let dd = -(alt2 - alt1) / dt;
     [dn as f32, de as f32, dd as f32]
 }

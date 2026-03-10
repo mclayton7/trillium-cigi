@@ -162,6 +162,9 @@ impl SensorControl {
         Some(Self {
             view_id: read_u8(buf, 2)?,
             sensor_id: read_u8(buf, 3)?,
+            // Standard CIGI encodes sensor_state in bits 0-1 (values 0-3).
+            // The simulator's geopoint extension (value 4) is host-internal and
+            // never arrives from a real GCS, so this mask is intentionally narrow.
             sensor_state: f4 & 0x03,
             polarity: f4 & 0x04 != 0,
             line_of_sight_enable: f4 & 0x08 != 0,
@@ -181,7 +184,7 @@ impl SensorControl {
 //  IG → Host
 // ══════════════════════════════════════════════════════════
 
-/// CIGI Start Of Frame (type 64, 16 bytes).
+/// CIGI Start Of Frame (type 101, 24 bytes).
 #[derive(Debug, Clone, Default)]
 pub struct StartOfFrame {
     pub ig_status: u8,
@@ -192,61 +195,45 @@ pub struct StartOfFrame {
     pub db_number: i16,
     pub ig_frame_ctr: u32,
     pub timestamp: f64,
-    pub last_host_pkt_id: u16,
+    pub last_host_frame_number: u32,
 }
 
 impl StartOfFrame {
-    pub const TYPE_ID: u8 = 64;
-    pub const SIZE: u8 = 16;
+    pub const TYPE_ID: u8 = 101;
+    pub const SIZE: u8 = 24;
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0u8; 16];
+        let mut out = vec![0u8; 24];
         out[0] = Self::TYPE_ID;
         out[1] = Self::SIZE;
-        // minor_version (bits 3-0), ig_mode (bits 7-4) — packed into one flags byte
-        // Byte layout per ICD: [type][size][ig_status][ig_mode flags][db_num H][db_num L][frame_ctr...][timestamp...]
-        // Simplified: embed fields as-is in a practical layout
-        out[2] = self.ig_status;
-        out[3] = (self.ig_mode & 0x03) << 6
-            | if self.timestamp_valid { 0x01 } else { 0 }
-            | if self.earth_ref_model { 0x02 } else { 0 }
-            | (self.minor_version & 0x0F) << 2;
-        out[4..6].copy_from_slice(&self.db_number.to_le_bytes());
-        out[6..8].copy_from_slice(&self.last_host_pkt_id.to_le_bytes());
+        out[2] = 3; // Major Version
+        out[3] = self.db_number as i8 as u8;
+        out[4] = self.ig_status;
+        out[5] = ((self.minor_version & 0x0F) << 4)
+            | if self.earth_ref_model { 0x08 } else { 0 }
+            | if self.timestamp_valid { 0x04 } else { 0 }
+            | (self.ig_mode & 0x03);
+        out[6..8].copy_from_slice(&0x8000u16.to_le_bytes());
         out[8..12].copy_from_slice(&self.ig_frame_ctr.to_le_bytes());
-        out[12..16].copy_from_slice(&(self.timestamp as f32).to_le_bytes());
-        // Note: ICD places timestamp as f64 in 16 bytes — we use f32 here to fit.
+        let ts_10us = (self.timestamp * 100_000.0) as u64 as u32; // intentional wrap every ~12 h
+        out[12..16].copy_from_slice(&ts_10us.to_le_bytes());
+        out[16..20].copy_from_slice(&self.last_host_frame_number.to_le_bytes());
+        // bytes 20-23: reserved = 0
         out
     }
 
 }
 
 
-/// CIGI Sensor Response (type 67, 24 bytes).
-#[derive(Debug, Clone, Default)]
-pub struct SensorResponse {
-    pub view_id: u8,
-    pub sensor_id: u8,
-    /// 0=Searching, 1=Tracking, 2=Impending breaklock, 3=Breaklock
-    pub sensor_status: u8,
-    pub gate_x_size: f32,
-    pub gate_y_size: f32,
-    pub gate_x_pos: f32,
-    pub gate_y_pos: f32,
-    pub frame_ctr: u32,
-    pub entity_id_valid: bool,
-    pub entity_id: u16,
-}
 
-
-/// CIGI Sensor Extended Response (type 68, 40 bytes).
+/// CIGI Sensor Extended Response (type 107, 48 bytes).
 #[derive(Debug, Clone, Default)]
 pub struct SensorExtendedResponse {
-    pub view_id: u8,
+    pub view_id: u16,
     pub sensor_id: u8,
     pub sensor_status: u8,
-    pub gate_x_size: f32,
-    pub gate_y_size: f32,
+    pub gate_x_size: u16,
+    pub gate_y_size: u16,
     pub gate_x_pos: f32,
     pub gate_y_pos: f32,
     pub frame_ctr: u32,
@@ -258,29 +245,26 @@ pub struct SensorExtendedResponse {
 }
 
 impl SensorExtendedResponse {
-    pub const TYPE_ID: u8 = 68;
-    pub const SIZE: u8 = 40;
+    pub const TYPE_ID: u8 = 107;
+    pub const SIZE: u8 = 48;
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0u8; 40];
+        let mut out = vec![0u8; 48];
         out[0] = Self::TYPE_ID;
         out[1] = Self::SIZE;
-        out[2] = self.view_id;
-        out[3] = self.sensor_id;
-        out[4] = self.sensor_status & 0x03 | if self.entity_id_valid { 0x04 } else { 0 };
-        out[5] = 0;
-        out[6..10].copy_from_slice(&self.gate_x_size.to_le_bytes());
-        out[10..14].copy_from_slice(&self.gate_y_size.to_le_bytes());
-        out[14..18].copy_from_slice(&self.gate_x_pos.to_le_bytes());
-        out[18..22].copy_from_slice(&self.gate_y_pos.to_le_bytes());
-        // Layout (40 bytes): [0..2 header][2 view_id][3 sensor_id][4 flags][5 pad]
-        // [6..10 gate_x_size][10..14 gate_y_size][14..18 gate_x_pos][18..22 gate_y_pos]
-        // [22..26 frame_ctr][26..28 entity_id][28..32 lat(f32)][32..36 lon(f32)][36..40 alt(f32)]
-        out[22..26].copy_from_slice(&self.frame_ctr.to_le_bytes());
-        out[26..28].copy_from_slice(&self.entity_id.to_le_bytes());
-        out[28..32].copy_from_slice(&(self.entity_lat as f32).to_le_bytes());
-        out[32..36].copy_from_slice(&(self.entity_lon as f32).to_le_bytes());
-        out[36..40].copy_from_slice(&(self.entity_alt as f32).to_le_bytes());
+        out[2..4].copy_from_slice(&self.view_id.to_le_bytes());
+        out[4] = self.sensor_id;
+        out[5] = (self.sensor_status & 0x03)
+            | if self.entity_id_valid { 0x04 } else { 0 };
+        out[6..8].copy_from_slice(&self.entity_id.to_le_bytes());
+        out[8..10].copy_from_slice(&self.gate_x_size.to_le_bytes());
+        out[10..12].copy_from_slice(&self.gate_y_size.to_le_bytes());
+        out[12..16].copy_from_slice(&self.gate_x_pos.to_le_bytes());
+        out[16..20].copy_from_slice(&self.gate_y_pos.to_le_bytes());
+        out[20..24].copy_from_slice(&self.frame_ctr.to_le_bytes());
+        out[24..32].copy_from_slice(&self.entity_lat.to_le_bytes());
+        out[32..40].copy_from_slice(&self.entity_lon.to_le_bytes());
+        out[40..48].copy_from_slice(&self.entity_alt.to_le_bytes());
         out
     }
 
@@ -312,18 +296,18 @@ impl SensorControl {
 #[cfg(test)]
 impl StartOfFrame {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 16 { return None; }
-        let flags = buf[3];
+        if buf.len() < 24 { return None; }
+        let flags = buf[5];
         Some(Self {
-            ig_status: buf[2],
-            ig_mode: (flags >> 6) & 0x03,
-            timestamp_valid: flags & 0x01 != 0,
-            earth_ref_model: flags & 0x02 != 0,
-            minor_version: (flags >> 2) & 0x0F,
-            db_number: i16::from_le_bytes([buf[4], buf[5]]),
-            last_host_pkt_id: u16::from_le_bytes([buf[6], buf[7]]),
+            ig_status: buf[4],
+            ig_mode: flags & 0x03,
+            timestamp_valid: flags & 0x04 != 0,
+            earth_ref_model: flags & 0x08 != 0,
+            minor_version: (flags >> 4) & 0x0F,
+            db_number: buf[3] as i8 as i16,
             ig_frame_ctr: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            timestamp: f32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as f64,
+            timestamp: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as f64 / 100_000.0,
+            last_host_frame_number: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
         })
     }
 }
@@ -370,12 +354,12 @@ mod tests {
             db_number: -1,
             ig_frame_ctr: 42,
             timestamp: 1.5,
-            last_host_pkt_id: 7,
+            last_host_frame_number: 7,
         };
         let enc = sof.encode();
-        assert_eq!(enc.len(), 16);
+        assert_eq!(enc.len(), 24);
         let dec = StartOfFrame::decode(&enc).expect("decode");
         assert_eq!(dec.ig_frame_ctr, 42);
-        assert_eq!(dec.last_host_pkt_id, 7);
+        assert_eq!(dec.last_host_frame_number, 7);
     }
 }

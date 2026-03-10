@@ -67,15 +67,12 @@ async fn main() {
                 sim.tick(0.02);
                 frame_ctr = frame_ctr.wrapping_add(1);
 
-                // ── Send Start of Frame (50 Hz) ──────────────────────
-                let sof = sim.to_start_of_frame();
-                srv.send(&sof.encode()).await.ok();
-
-                // ── Send Sensor (Extended) Response at 10 Hz ─────────
+                // ── Send IG→Host datagram (SOF + optional SER in one packet) ──
+                let mut msg = sim.to_start_of_frame().encode();
                 if frame_ctr % 5 == 0 {
-                    let sr = sim.to_sensor_extended_response();
-                    srv.send(&sr.encode()).await.ok();
+                    msg.extend_from_slice(&sim.to_sensor_extended_response().encode());
                 }
+                srv.send(&msg).await.ok();
 
                 // ── Diagnostics at 1 Hz ──────────────────────────────
                 if diag_enabled && frame_ctr % 50 == 0 {

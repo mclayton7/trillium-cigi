@@ -633,7 +633,7 @@ impl GimbalSimulator {
             db_number: 0,
             ig_frame_ctr: self.frame_ctr,
             timestamp: self.system_time_ms as f64 / 1000.0,
-            last_host_pkt_id: self.host_frame_ctr as u16,
+            last_host_frame_number: self.host_frame_ctr,
         }
     }
 }
@@ -735,7 +735,9 @@ mod tests {
             sim.tick(0.1);
         }
         let sr = sim.to_sensor_extended_response();
-        assert!(sr.gate_x_pos.abs() > 0.0 || sr.gate_y_pos.abs() < 1e-3);
+        // Pan target was 0.5π rad ≈ 90°; tilt target was 0 rad.
+        assert!((sr.gate_x_pos - 90.0).abs() < 1.0, "gate_x_pos={}", sr.gate_x_pos);
+        assert!(sr.gate_y_pos.abs() < 1.0, "gate_y_pos={}", sr.gate_y_pos);
     }
 
     #[test]
