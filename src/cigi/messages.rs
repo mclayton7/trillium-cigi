@@ -322,6 +322,198 @@ impl StartOfFrame {
 mod tests {
     use super::*;
 
+    // ── IgControl::encode ────────────────────────────────────────────────
+
+    #[test]
+    fn ig_control_encode_size_and_type() {
+        let ig = IgControl::default();
+        let enc = ig.encode();
+        assert_eq!(enc.len(), 24);
+        assert_eq!(enc[0], IgControl::TYPE_ID);
+        assert_eq!(enc[1], 24);
+    }
+
+    #[test]
+    fn ig_control_encode_frame_ctr() {
+        let ig = IgControl { frame_ctr: 0x0102_0304, ..Default::default() };
+        let enc = ig.encode();
+        assert_eq!(&enc[8..12], &0x0102_0304u32.to_le_bytes());
+    }
+
+    #[test]
+    fn ig_control_encode_db_number() {
+        let ig = IgControl { db_number: 42, ..Default::default() };
+        let enc = ig.encode();
+        assert_eq!(&enc[4..6], &42i16.to_le_bytes());
+    }
+
+    #[test]
+    fn ig_control_encode_minor_version() {
+        let ig = IgControl { minor_version: 3, ..Default::default() };
+        let enc = ig.encode();
+        assert_eq!(enc[3], 3);
+    }
+
+    #[test]
+    fn ig_control_encode_flags_byte() {
+        let ig = IgControl {
+            ig_mode: 2,
+            timestamp_valid: true,
+            extrapolation_enable: true,
+            ..Default::default()
+        };
+        let enc = ig.encode();
+        // bits [7:6] = ig_mode=2, bit1 = extrapolation_enable, bit0 = timestamp_valid
+        assert_eq!(enc[2] & 0x03, 0x03); // both flags set
+        assert_eq!((enc[2] >> 6) & 0x03, 2); // ig_mode
+    }
+
+    // ── EntityControl::encode ────────────────────────────────────────────
+
+    #[test]
+    fn entity_control_encode_size_and_type() {
+        let ec = EntityControl::default();
+        let enc = ec.encode();
+        assert_eq!(enc.len(), 48);
+        assert_eq!(enc[0], EntityControl::TYPE_ID);
+        assert_eq!(enc[1], 48);
+    }
+
+    #[test]
+    fn entity_control_encode_entity_id() {
+        let ec = EntityControl { entity_id: 0x1234, ..Default::default() };
+        let enc = ec.encode();
+        assert_eq!(&enc[2..4], &0x1234u16.to_le_bytes());
+    }
+
+    #[test]
+    fn entity_control_encode_roll_f32() {
+        let ec = EntityControl { roll: 1.5, ..Default::default() };
+        let enc = ec.encode();
+        assert_eq!(f32::from_le_bytes([enc[12], enc[13], enc[14], enc[15]]), 1.5);
+    }
+
+    #[test]
+    fn entity_control_encode_lat_f64() {
+        let ec = EntityControl { lat_or_x: 38.897670, ..Default::default() };
+        let enc = ec.encode();
+        let v = f64::from_le_bytes(enc[24..32].try_into().unwrap());
+        assert!((v - 38.897670).abs() < 1e-9);
+    }
+
+    #[test]
+    fn entity_control_encode_entity_state_bits() {
+        let ec = EntityControl { entity_state: 1, attach_state: true, ..Default::default() };
+        let enc = ec.encode();
+        assert_eq!(enc[4] & 0x03, 1); // entity_state
+        assert_ne!(enc[4] & 0x04, 0); // attach_state
+    }
+
+    // ── SensorControl geopoint ───────────────────────────────────────────
+
+    #[test]
+    fn sensor_control_geopoint_state_4_encoding() {
+        let sc = SensorControl { sensor_state: 4, ..Default::default() };
+        let enc = sc.encode();
+        assert_eq!(enc[4] & 0x07, 4, "byte4 low bits should be 4");
+    }
+
+    #[test]
+    fn sensor_control_geopoint_response_type_bit() {
+        let sc = SensorControl { sensor_state: 4, response_type: true, ..Default::default() };
+        let enc = sc.encode();
+        assert_ne!(enc[4] & 0x80, 0);
+    }
+
+    #[test]
+    fn sensor_control_geopoint_polarity_ignored() {
+        let sc_pol = SensorControl { sensor_state: 4, polarity: true, ..Default::default() };
+        let sc_nopol = SensorControl { sensor_state: 4, polarity: false, ..Default::default() };
+        // polarity has no effect in geopoint mode
+        assert_eq!(sc_pol.encode()[4], sc_nopol.encode()[4]);
+    }
+
+    #[test]
+    fn sensor_control_geopoint_roundtrip() {
+        let sc = SensorControl { sensor_state: 4, track_mode: 2, gain: 0.3, level: 0.7, ..Default::default() };
+        let dec = SensorControl::decode(&sc.encode()).unwrap();
+        assert_eq!(dec.sensor_state, 4);
+        assert_eq!(dec.track_mode, 2);
+    }
+
+    // ── SensorExtendedResponse::decode ───────────────────────────────────
+
+    #[test]
+    fn sensor_extended_response_decode_too_short() {
+        assert!(SensorExtendedResponse::decode(&[0u8; 47]).is_none());
+    }
+
+    #[test]
+    fn sensor_extended_response_decode_fields() {
+        let mut buf = vec![0u8; 48];
+        buf[0] = SensorExtendedResponse::TYPE_ID;
+        buf[1] = 48;
+        // view_id = 7 at [2..4]
+        buf[2..4].copy_from_slice(&7u16.to_le_bytes());
+        // sensor_id = 3 at [4]
+        buf[4] = 3;
+        // sensor_status bits = 1 (tracking) at [5]
+        buf[5] = 0x01;
+        // gate_x_size at [8..10]
+        buf[8..10].copy_from_slice(&20u16.to_le_bytes());
+        // gate_x_pos f32 at [12..16]
+        buf[12..16].copy_from_slice(&45.0f32.to_le_bytes());
+        // entity_lat f64 at [24..32]
+        buf[24..32].copy_from_slice(&38.897_f64.to_le_bytes());
+        let r = SensorExtendedResponse::decode(&buf).expect("decode");
+        assert_eq!(r.view_id, 7);
+        assert_eq!(r.sensor_id, 3);
+        assert_eq!(r.sensor_status, 1);
+        assert_eq!(r.gate_x_size, 20);
+        assert!((r.gate_x_pos - 45.0).abs() < 1e-5);
+        assert!((r.entity_lat - 38.897).abs() < 1e-6);
+    }
+
+    // ── StartOfFrame::decode ─────────────────────────────────────────────
+
+    #[test]
+    fn start_of_frame_decode_too_short() {
+        assert!(StartOfFrame::decode(&[0u8; 23]).is_none());
+    }
+
+    #[test]
+    fn start_of_frame_roundtrip_all_fields() {
+        let sof = StartOfFrame {
+            ig_status: 5,
+            ig_mode: 1,
+            timestamp_valid: true,
+            earth_ref_model: true,
+            minor_version: 3,
+            db_number: -2,
+            ig_frame_ctr: 999,
+            timestamp: 1.23456,
+            last_host_frame_number: 88,
+        };
+        let enc = sof.encode();
+        let dec = StartOfFrame::decode(&enc).unwrap();
+        assert_eq!(dec.ig_status, 5);
+        assert_eq!(dec.ig_mode, 1);
+        assert!(dec.timestamp_valid);
+        assert!(dec.earth_ref_model);
+        assert_eq!(dec.minor_version, 3);
+        assert_eq!(dec.db_number, -2);
+        assert_eq!(dec.ig_frame_ctr, 999);
+        assert_eq!(dec.last_host_frame_number, 88);
+    }
+
+    #[test]
+    fn start_of_frame_timestamp_precision() {
+        let sof = StartOfFrame { timestamp: 1.5, ..Default::default() };
+        let dec = StartOfFrame::decode(&sof.encode()).unwrap();
+        // Stored as 10-µs integer, so precision is 10 µs = 0.00001 s
+        assert!((dec.timestamp - 1.5).abs() < 0.00002, "ts={}", dec.timestamp);
+    }
+
     #[test]
     fn sensor_control_roundtrip() {
         let sc = SensorControl {

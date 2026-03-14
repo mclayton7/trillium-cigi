@@ -247,3 +247,219 @@ pub fn camera_fov(index: i8) -> (f32, f32) {
         .copied()
         .unwrap_or(CAMERA_TABLE[0])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_temp(name: &str, content: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("cigi_trillium_cfg_test_{}.toml", name));
+        fs::write(&p, content).expect("write temp config");
+        p.to_string_lossy().into_owned()
+    }
+
+    // ── Config::load ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_missing_file_returns_default() {
+        let cfg = Config::load("/tmp/cigi_trillium_no_such_file_xyz999.toml");
+        let def = Config::default();
+        assert_eq!(cfg.orion_listen_port, def.orion_listen_port);
+        assert_eq!(cfg.scene_generator_ip, def.scene_generator_ip);
+        assert_eq!(cfg.max_slew_rate, def.max_slew_rate);
+        assert_eq!(cfg.platform_lat, def.platform_lat);
+    }
+
+    #[test]
+    fn load_known_keys_parsed_correctly() {
+        let content = concat!(
+            "max_slew_rate_deg_s = 120.0\n",
+            "orion_listen_port = 9090\n",
+            "platform_lat_deg = 45.0\n",
+            "mavlink_system_id = 7\n",
+            "stanag_vehicle_id = 42\n",
+        );
+        let path = write_temp("known_keys", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!((cfg.max_slew_rate - 120_f32.to_radians()).abs() < 1e-5);
+        assert_eq!(cfg.orion_listen_port, 9090);
+        assert!((cfg.platform_lat - 45_f64.to_radians()).abs() < 1e-10);
+        assert_eq!(cfg.mavlink_system_id, 7);
+        assert_eq!(cfg.stanag_vehicle_id, 42);
+    }
+
+    #[test]
+    fn load_comments_and_section_headers_ignored() {
+        let content = concat!(
+            "# this is a comment\n",
+            "[network]\n",
+            "orion_listen_port = 1234\n",
+        );
+        let path = write_temp("comments", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.orion_listen_port, 1234);
+        assert_eq!(cfg.scene_generator_ip, "127.0.0.1");
+    }
+
+    #[test]
+    fn load_unknown_keys_silently_ignored() {
+        let content = concat!(
+            "totally_unknown_key = 999\n",
+            "orion_listen_port = 5555\n",
+        );
+        let path = write_temp("unknown_keys", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.orion_listen_port, 5555);
+        assert_eq!(cfg.cigi_listen_port, 8101); // default untouched
+    }
+
+    #[test]
+    fn load_whitespace_around_equals_handled() {
+        let content = concat!("orion_listen_port=7777\n", "cigi_listen_port = 6666\n");
+        let path = write_temp("whitespace_eq", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.orion_listen_port, 7777);
+        assert_eq!(cfg.cigi_listen_port, 6666);
+    }
+
+    #[test]
+    fn load_quoted_string_values_stripped() {
+        let content = "scene_generator_ip = \"192.168.1.50\"\n";
+        let path = write_temp("quoted_string", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.scene_generator_ip, "192.168.1.50");
+    }
+
+    #[test]
+    fn load_platform_lat_deg_to_radians() {
+        let content = "platform_lat_deg = 90.0\n";
+        let path = write_temp("platform_lat", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!((cfg.platform_lat - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
+    }
+
+    #[test]
+    fn load_mavlink_system_id_max() {
+        let content = "mavlink_system_id = 255\n";
+        let path = write_temp("mavlink_id", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.mavlink_system_id, 255_u8);
+    }
+
+    #[test]
+    fn load_stanag_vehicle_id_negative() {
+        let content = "stanag_vehicle_id = -1\n";
+        let path = write_temp("stanag_vid", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.stanag_vehicle_id, -1_i32);
+    }
+
+    // ── Config::is_continuous_pan ─────────────────────────────────────────────
+
+    #[test]
+    fn is_continuous_pan_default_is_false() {
+        assert!(!Config::default().is_continuous_pan());
+    }
+
+    #[test]
+    fn is_continuous_pan_true_at_360_deg() {
+        let content = "pan_limit_deg = 360.0\n";
+        let path = write_temp("continuous_pan", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(cfg.is_continuous_pan());
+    }
+
+    #[test]
+    fn is_continuous_pan_true_at_exact_threshold() {
+        let mut cfg = Config::default();
+        cfg.pan_limit = std::f32::consts::TAU - 0.001;
+        assert!(cfg.is_continuous_pan());
+    }
+
+    #[test]
+    fn is_continuous_pan_false_just_below_threshold() {
+        let mut cfg = Config::default();
+        cfg.pan_limit = std::f32::consts::TAU - 0.002;
+        assert!(!cfg.is_continuous_pan());
+    }
+
+    // ── Config::fov_at_zoom ───────────────────────────────────────────────────
+
+    #[test]
+    fn fov_at_zoom_zero_returns_wide() {
+        let cfg = Config::default();
+        let (h, v) = cfg.fov_at_zoom(0.0);
+        assert!((h - cfg.hfov_wide).abs() < 1e-6);
+        assert!((v - cfg.vfov_wide).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fov_at_zoom_one_returns_narrow() {
+        let cfg = Config::default();
+        let (h, v) = cfg.fov_at_zoom(1.0);
+        assert!((h - cfg.hfov_narrow).abs() < 1e-6);
+        assert!((v - cfg.vfov_narrow).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fov_at_zoom_half_is_midpoint() {
+        let cfg = Config::default();
+        let (h, v) = cfg.fov_at_zoom(0.5);
+        assert!((h - (cfg.hfov_wide + cfg.hfov_narrow) / 2.0).abs() < 1e-6);
+        assert!((v - (cfg.vfov_wide + cfg.vfov_narrow) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fov_at_zoom_clamped_below_zero() {
+        let cfg = Config::default();
+        assert_eq!(cfg.fov_at_zoom(-0.1), cfg.fov_at_zoom(0.0));
+    }
+
+    #[test]
+    fn fov_at_zoom_clamped_above_one() {
+        let cfg = Config::default();
+        assert_eq!(cfg.fov_at_zoom(1.1), cfg.fov_at_zoom(1.0));
+    }
+
+    // ── camera_fov ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn camera_fov_index_0() {
+        assert_eq!(camera_fov(0), (30.0, 22.5));
+    }
+
+    #[test]
+    fn camera_fov_index_1() {
+        assert_eq!(camera_fov(1), (5.0, 3.75));
+    }
+
+    #[test]
+    fn camera_fov_index_2() {
+        assert_eq!(camera_fov(2), (20.0, 15.0));
+    }
+
+    #[test]
+    fn camera_fov_out_of_range_falls_back_to_cam0() {
+        assert_eq!(camera_fov(99), CAMERA_TABLE[0]);
+    }
+}
