@@ -11,9 +11,9 @@ mod trillium;
 use std::time::{Duration, Instant};
 
 use config::Config;
-use platform::PlatformState;
+use platform::{MavLinkSource, PlatformSource, PlatformState, Stanag4586Source, StaticSource};
 use simulator::GimbalSimulator;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use cigi::host::{CigiResponse, build_datagram};
@@ -35,10 +35,15 @@ async fn main() {
 
     // ── CLI args ──────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
-    let diag_enabled = args.contains(&"--diag".to_string());
+    let diag_enabled = args.iter().any(|a| a == "--diag");
 
-    // ── Platform state (static from config for now) ───────────────────────
-    let platform = PlatformState::from_config(&cfg);
+    // ── Platform state — watch channel seeded from config ────────────────
+    let (platform_tx, platform_rx) = watch::channel(PlatformState::from_config(&cfg));
+    match cfg.platform_source.as_str() {
+        "mavlink"    => tokio::spawn(MavLinkSource::from_config(&cfg).run(platform_tx)),
+        "stanag4586" => tokio::spawn(Stanag4586Source::from_config(&cfg).run(platform_tx)),
+        _            => tokio::spawn(StaticSource::from_config(&cfg).run(platform_tx)),
+    };
 
     // ── Fallback simulator ────────────────────────────────────────────────
     let mut sim = GimbalSimulator::with_config(cfg.clone());
@@ -92,6 +97,7 @@ async fn main() {
 
                 if sg_connected {
                     // ── Scene generator path ─────────────────────────────
+                    let platform = platform_rx.borrow().clone();
                     let ig = make_ig_control(frame_ctr);
                     let ec = platform_to_entity_control(&platform, PLATFORM_ENTITY_ID);
                     let sc = last_cmd.as_ref().map(orion_cmd_to_sensor_control);
@@ -108,6 +114,7 @@ async fn main() {
                     // Send synthetic telemetry at 10 Hz (every 5 ticks)
                     if frame_ctr % 5 == 0 {
                         let ser = sim.to_sensor_extended_response();
+                        let platform = platform_rx.borrow().clone();
                         let telem = sensor_response_to_telemetry(&ser, &platform);
                         orion_telem_tx.try_send(telem).ok();
                     }
@@ -131,6 +138,7 @@ async fn main() {
                         last_sof = Some(Instant::now());
                     }
                     CigiResponse::SensorResponse(ser) => {
+                        let platform = platform_rx.borrow().clone();
                         let telem = sensor_response_to_telemetry(&ser, &platform);
                         orion_telem_tx.try_send(telem).ok();
                     }

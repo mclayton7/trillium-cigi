@@ -32,25 +32,25 @@ Optionally, the same process can act as a **transparent TCP proxy** to a real Or
 
 ## Feature Summary
 
-| Feature | Detail |
-|---------|--------|
-| CIGI v3.3 UDP server | Port configurable in `config.toml`; learns host address from first packet |
-| Trapezoidal slew profile | Configurable max rate + acceleration; no instantaneous jumps |
-| Mechanical angle limits | ±170° pan, −110°/+30° tilt by default; fully configurable; 360° continuous-pan supported |
-| Rate mode | `OrionModeRate` — gain/level command continuous angular rates |
-| Geopoint mode | `OrionModeGeopoint` — aims gimbal at a commanded WGS84 coordinate |
-| Track mode | `OrionModeTrack` — proportional controller; simulates track loss at FOV edge |
-| WGS84 geolocation | Platform position + gimbal angles → ground look-point; populates `entity_lat/lon/alt` |
-| Platform stabilisation | EntityControl roll/pitch/yaw → `gimbal_quat` + `ins_quat` in telemetry |
-| Vibration / jitter | Sinusoidal airframe vibration + LCG white-noise floor; amplitude scales with slew rate |
-| Zoom / FOV simulation | Zoom level 0–1 maps to configurable wide/narrow FOV pair |
-| Multi-camera | 3 cameras (EO wide, EO narrow, IR) selectable by `sensor_id`; 200 ms switch blackout |
-| Fault injection | GPS loss, motor fault, IMU dropout, thermal warning — API on `sim.faults` |
-| Diagnostics | `--diag` flag logs voltages, currents, temps at 1 Hz |
-| Runtime configuration | `config.toml` — no recompile needed to tune any parameter |
-| TCP bridge | `--gimbal-ip <host>` — proxies commands to real hardware, applies real telemetry |
-| Auto-reconnect | Bridge retries every 5 s if the TCP connection drops |
-| Compile-time codegen | `build.rs` generates typed Rust structs for all 80+ Orion protocol packets from XML |
+| Feature                  | Detail                                                                                   |
+| ------------------------ | ---------------------------------------------------------------------------------------- |
+| CIGI v3.3 UDP server     | Port configurable in `config.toml`; learns host address from first packet                |
+| Trapezoidal slew profile | Configurable max rate + acceleration; no instantaneous jumps                             |
+| Mechanical angle limits  | ±170° pan, −110°/+30° tilt by default; fully configurable; 360° continuous-pan supported |
+| Rate mode                | `OrionModeRate` — gain/level command continuous angular rates                            |
+| Geopoint mode            | `OrionModeGeopoint` — aims gimbal at a commanded WGS84 coordinate                        |
+| Track mode               | `OrionModeTrack` — proportional controller; simulates track loss at FOV edge             |
+| WGS84 geolocation        | Platform position + gimbal angles → ground look-point; populates `entity_lat/lon/alt`    |
+| Platform stabilisation   | EntityControl roll/pitch/yaw → `gimbal_quat` + `ins_quat` in telemetry                   |
+| Vibration / jitter       | Sinusoidal airframe vibration + LCG white-noise floor; amplitude scales with slew rate   |
+| Zoom / FOV simulation    | Zoom level 0–1 maps to configurable wide/narrow FOV pair                                 |
+| Multi-camera             | 3 cameras (EO wide, EO narrow, IR) selectable by `sensor_id`; 200 ms switch blackout     |
+| Fault injection          | GPS loss, motor fault, IMU dropout, thermal warning — API on `sim.faults`                |
+| Diagnostics              | `--diag` flag logs voltages, currents, temps at 1 Hz                                     |
+| Runtime configuration    | `config.toml` — no recompile needed to tune any parameter                                |
+| TCP bridge               | `--gimbal-ip <host>` — proxies commands to real hardware, applies real telemetry         |
+| Auto-reconnect           | Bridge retries every 5 s if the TCP connection drops                                     |
+| Compile-time codegen     | `build.rs` generates typed Rust structs for all 80+ Orion protocol packets from XML      |
 
 ---
 
@@ -129,33 +129,33 @@ Set `pan_limit_deg = 360` (or greater) to enable continuous rotation. The simula
 
 ### Host → Simulator
 
-| Message | Type ID | Size | Effect |
-|---------|---------|------|--------|
-| `IgControl` | 1 | 24 B | Updates IG mode and host frame counter |
-| `EntityControl` | 2 | 48 B | Sets platform lat/lon/alt and roll/pitch/yaw; drives INS/vel_ned |
-| `SensorControl` | 17 | 24 B | Commands gimbal mode, pointing, zoom, and camera (see below) |
+| Message         | Type ID | Size | Effect                                                           |
+| --------------- | ------- | ---- | ---------------------------------------------------------------- |
+| `IgControl`     | 1       | 24 B | Updates IG mode and host frame counter                           |
+| `EntityControl` | 2       | 48 B | Sets platform lat/lon/alt and roll/pitch/yaw; drives INS/vel_ned |
+| `SensorControl` | 17      | 24 B | Commands gimbal mode, pointing, zoom, and camera (see below)     |
 
 #### `SensorControl` Field Mapping
 
-| Field | Range | Meaning |
-|-------|-------|---------|
-| `sensor_state` | 0–4 | Gimbal mode (see table below) |
-| `track_mode` bit 0 | 0/1 | When `sensor_state=1`: 0 → Position, 1 → Rate |
-| `sensor_id` | 0–2 | Camera: 0 = EO wide, 1 = EO narrow, 2 = IR |
-| `gain` | 0.0–1.0 | Pan target `(gain×2−1)×π` rad (Position); pan rate ×max_rate (Rate); track X offset −0.5→+0.5 (Track) |
-| `level` | 0.0–1.0 | Tilt target / rate / track Y offset (same encoding as gain) |
-| `ac_coupling` | 0.0–1.0 | Zoom level (0 = wide, 1 = narrow) in Position/Rate modes; geopoint lat fraction in Geopoint mode |
-| `noise` | 0.0–1.0 | Geopoint lon fraction (Geopoint mode only) |
+| Field              | Range   | Meaning                                                                                               |
+| ------------------ | ------- | ----------------------------------------------------------------------------------------------------- |
+| `sensor_state`     | 0–4     | Gimbal mode (see table below)                                                                         |
+| `track_mode` bit 0 | 0/1     | When `sensor_state=1`: 0 → Position, 1 → Rate                                                         |
+| `sensor_id`        | 0–2     | Camera: 0 = EO wide, 1 = EO narrow, 2 = IR                                                            |
+| `gain`             | 0.0–1.0 | Pan target `(gain×2−1)×π` rad (Position); pan rate ×max_rate (Rate); track X offset −0.5→+0.5 (Track) |
+| `level`            | 0.0–1.0 | Tilt target / rate / track Y offset (same encoding as gain)                                           |
+| `ac_coupling`      | 0.0–1.0 | Zoom level (0 = wide, 1 = narrow) in Position/Rate modes; geopoint lat fraction in Geopoint mode      |
+| `noise`            | 0.0–1.0 | Geopoint lon fraction (Geopoint mode only)                                                            |
 
 #### `sensor_state` → Gimbal Mode
 
-| `sensor_state` | `track_mode` bit 0 | Orion mode | Behaviour |
-|---|---|---|---|
-| 0 | — | `OrionModeDisabled` | Motors off; telemetry still sent |
-| 1 | 0 | `OrionModePosition` | Slew to gain/level pan/tilt target |
-| 1 | 1 | `OrionModeRate` | Continuous rate command in rad/s |
-| 2 | — | `OrionModeTrack` | Proportional track controller; gain/level = centroid offset |
-| 4 | — | `OrionModeGeopoint` | Point at WGS84 coordinate encoded in ac_coupling/noise |
+| `sensor_state` | `track_mode` bit 0 | Orion mode          | Behaviour                                                   |
+| -------------- | ------------------ | ------------------- | ----------------------------------------------------------- |
+| 0              | —                  | `OrionModeDisabled` | Motors off; telemetry still sent                            |
+| 1              | 0                  | `OrionModePosition` | Slew to gain/level pan/tilt target                          |
+| 1              | 1                  | `OrionModeRate`     | Continuous rate command in rad/s                            |
+| 2              | —                  | `OrionModeTrack`    | Proportional track controller; gain/level = centroid offset |
+| 4              | —                  | `OrionModeGeopoint` | Point at WGS84 coordinate encoded in ac_coupling/noise      |
 
 **Geopoint coordinate encoding**:
 ```
@@ -165,21 +165,21 @@ target_lon_deg = noise × 360 − 180           (−180° to +180°)
 
 ### Simulator → Host
 
-| Message | Type ID | Size | Cadence | Contents |
-|---------|---------|------|---------|----------|
-| `StartOfFrame` | 64 | 16 B | 50 Hz | IG mode, frame counter, timestamp |
-| `SensorExtendedResponse` | 68 | 40 B | 10 Hz | Gate position, sensor status, entity look-point lat/lon/alt |
+| Message                  | Type ID | Size | Cadence | Contents                                                    |
+| ------------------------ | ------- | ---- | ------- | ----------------------------------------------------------- |
+| `StartOfFrame`           | 64      | 16 B | 50 Hz   | IG mode, frame counter, timestamp                           |
+| `SensorExtendedResponse` | 68      | 40 B | 10 Hz   | Gate position, sensor status, entity look-point lat/lon/alt |
 
 #### `SensorExtendedResponse` Field Mapping
 
-| Simulator state | CIGI field | Notes |
-|-----------------|-----------|-------|
-| `pan` (rad, with jitter) | `gate_x_pos` | Normalised by HFOV |
-| `tilt` (rad, with jitter) | `gate_y_pos` | Normalised by VFOV |
-| `look_lat` (rad) | `entity_lat` (deg) | WGS84 ground look-point; 0,0,0 during camera switch |
-| `look_lon` (rad) | `entity_lon` (deg) | — |
-| `look_alt` (m) | `entity_alt` (m) | — |
-| `mode` | `sensor_status` | Active→0, Tracking→1, Disabled/Fault→3 |
+| Simulator state           | CIGI field         | Notes                                               |
+| ------------------------- | ------------------ | --------------------------------------------------- |
+| `pan` (rad, with jitter)  | `gate_x_pos`       | Normalised by HFOV                                  |
+| `tilt` (rad, with jitter) | `gate_y_pos`       | Normalised by VFOV                                  |
+| `look_lat` (rad)          | `entity_lat` (deg) | WGS84 ground look-point; 0,0,0 during camera switch |
+| `look_lon` (rad)          | `entity_lon` (deg) | —                                                   |
+| `look_alt` (m)            | `entity_alt` (m)   | —                                                   |
+| `mode`                    | `sensor_status`    | Active→0, Tracking→1, Disabled/Fault→3              |
 
 ---
 
@@ -234,22 +234,22 @@ The `los_ecef` field in `GeolocateTelemetryCorePacket` is populated each frame. 
 
 `EntityControl` sets the platform position **and attitude**:
 
-| EntityControl field | Unit | Effect |
-|--------------------|------|--------|
-| `lat_or_x` | degrees | Platform latitude |
-| `lon_or_y` | degrees | Platform longitude |
-| `alt_or_z` | metres MSL | Platform altitude |
-| `roll` | degrees | Used for `gimbal_quat` / `ins_quat` |
-| `pitch` | degrees | — |
-| `yaw` | degrees | Heading; offsets gimbal azimuth in LOS computation |
+| EntityControl field | Unit       | Effect                                             |
+| ------------------- | ---------- | -------------------------------------------------- |
+| `lat_or_x`          | degrees    | Platform latitude                                  |
+| `lon_or_y`          | degrees    | Platform longitude                                 |
+| `alt_or_z`          | metres MSL | Platform altitude                                  |
+| `roll`              | degrees    | Used for `gimbal_quat` / `ins_quat`                |
+| `pitch`             | degrees    | —                                                  |
+| `yaw`               | degrees    | Heading; offsets gimbal azimuth in LOS computation |
 
 Computed fields written to `GeolocateTelemetryCorePacket` each frame:
 
-| Telemetry field | Source |
-|----------------|--------|
-| `gimbal_quat` | Quaternion from Rz(pan) × Ry(−tilt) |
-| `ins_quat` | ZYX Euler quaternion from platform roll/pitch/yaw; `None` during IMU dropout |
-| `vel_ned` | NED velocity estimated from successive EntityControl positions (assumes 50 Hz update) |
+| Telemetry field | Source                                                                                |
+| --------------- | ------------------------------------------------------------------------------------- |
+| `gimbal_quat`   | Quaternion from Rz(pan) × Ry(−tilt)                                                   |
+| `ins_quat`      | ZYX Euler quaternion from platform roll/pitch/yaw; `None` during IMU dropout          |
+| `vel_ned`       | NED velocity estimated from successive EntityControl positions (assumes 50 Hz update) |
 
 ---
 
@@ -332,26 +332,26 @@ cargo test
 
 18 tests across 4 modules:
 
-| Module | Test | Verifies |
-|--------|------|----------|
-| `geo` | `ecef_roundtrip` | Geodetic→ECEF→geodetic within 0.01 m / 1e-10 rad |
-| `geo` | `look_point_nadir` | Straight-down LOS lands directly below platform |
-| `geo` | `inverse_geopoint_roundtrip` | forward + inverse geolocation agrees within 0.01 rad |
-| `cigi::messages` | `sensor_control_roundtrip` | SensorControl encode/decode field preservation |
-| `cigi::messages` | `start_of_frame_roundtrip` | StartOfFrame encode/decode |
-| `orion::wire` | `frame_parse_roundtrip` | Orion wire framing + Fletcher-16 checksum |
-| `orion::wire` | `parse_skips_garbage` | Sync-byte scanner skips leading junk |
-| `orion::wire` | `empty_payload` | Zero-length payload frames correctly |
-| `orion::wire` | `orion_cmd_packet_roundtrip` | OrionCmdPacket encode→frame→parse→decode within scaler precision |
-| `simulator` | `slew_toward_target` | Pan/tilt converge within 1e-4 rad in ≤ 10 s |
-| `simulator` | `accel_profile_smooth` | Rate is sub-max after 1 ms (not instantaneous) |
-| `simulator` | `angle_limits_enforced` | Clamping and limit flags set correctly |
-| `simulator` | `apply_sensor_control_sets_mode` | Mode and target mapping from SensorControl |
-| `simulator` | `rate_mode_integrates` | pan = rate × dt after one tick |
-| `simulator` | `camera_switch_blackout` | entity lat/lon/alt zeroed during 200 ms switch window |
-| `simulator` | `sensor_response_end_to_end` | Full pipeline: command → ticks → SensorResponse |
-| `simulator` | `gimbal_quat_unit_length` | gimbal_quat is a valid unit quaternion |
-| `simulator` | `platform_quat_unit_length` | ins_quat is a valid unit quaternion |
+| Module           | Test                             | Verifies                                                         |
+| ---------------- | -------------------------------- | ---------------------------------------------------------------- |
+| `geo`            | `ecef_roundtrip`                 | Geodetic→ECEF→geodetic within 0.01 m / 1e-10 rad                 |
+| `geo`            | `look_point_nadir`               | Straight-down LOS lands directly below platform                  |
+| `geo`            | `inverse_geopoint_roundtrip`     | forward + inverse geolocation agrees within 0.01 rad             |
+| `cigi::messages` | `sensor_control_roundtrip`       | SensorControl encode/decode field preservation                   |
+| `cigi::messages` | `start_of_frame_roundtrip`       | StartOfFrame encode/decode                                       |
+| `orion::wire`    | `frame_parse_roundtrip`          | Orion wire framing + Fletcher-16 checksum                        |
+| `orion::wire`    | `parse_skips_garbage`            | Sync-byte scanner skips leading junk                             |
+| `orion::wire`    | `empty_payload`                  | Zero-length payload frames correctly                             |
+| `orion::wire`    | `orion_cmd_packet_roundtrip`     | OrionCmdPacket encode→frame→parse→decode within scaler precision |
+| `simulator`      | `slew_toward_target`             | Pan/tilt converge within 1e-4 rad in ≤ 10 s                      |
+| `simulator`      | `accel_profile_smooth`           | Rate is sub-max after 1 ms (not instantaneous)                   |
+| `simulator`      | `angle_limits_enforced`          | Clamping and limit flags set correctly                           |
+| `simulator`      | `apply_sensor_control_sets_mode` | Mode and target mapping from SensorControl                       |
+| `simulator`      | `rate_mode_integrates`           | pan = rate × dt after one tick                                   |
+| `simulator`      | `camera_switch_blackout`         | entity lat/lon/alt zeroed during 200 ms switch window            |
+| `simulator`      | `sensor_response_end_to_end`     | Full pipeline: command → ticks → SensorResponse                  |
+| `simulator`      | `gimbal_quat_unit_length`        | gimbal_quat is a valid unit quaternion                           |
+| `simulator`      | `platform_quat_unit_length`      | ins_quat is a valid unit quaternion                              |
 
 ---
 
@@ -417,16 +417,16 @@ sock.close()
 
 At `cargo build` time, `build.rs` parses `OrionPublicProtocol.xml` (~1 700 lines, 80+ message types) and writes `$OUT_DIR/orion_generated.rs` with type-safe Rust for every packet:
 
-| XML feature | Generated Rust |
-|------------|----------------|
-| `<enum>` | `pub enum Foo` with `Default` + `TryFrom<u8>` |
-| `<struct>` | `pub struct Foo` with `encode(&mut Vec<u8>)` / `decode(&mut &[u8])` |
+| XML feature       | Generated Rust                                                                         |
+| ----------------- | -------------------------------------------------------------------------------------- |
+| `<enum>`          | `pub enum Foo` with `Default` + `TryFrom<u8>`                                          |
+| `<struct>`        | `pub struct Foo` with `encode(&mut Vec<u8>)` / `decode(&mut &[u8])`                    |
 | `<packet id="N">` | `pub struct FooPacket` with `const ID: u8 = N`, `encode() -> Vec<u8>`, `decode(&[u8])` |
-| `scaler="1000"` | `wire = (value * 1000).round() as i16` |
-| `max="pi"` | linear normalisation to `[0, MAX_INT]` |
-| `bitfieldN` | packed bits within byte, MSB-first |
-| `dependsOn` | `Option<T>` — conditionally encoded/decoded |
-| `variableArray` | `Vec<T>` — length from preceding count field |
+| `scaler="1000"`   | `wire = (value * 1000).round() as i16`                                                 |
+| `max="pi"`        | linear normalisation to `[0, MAX_INT]`                                                 |
+| `bitfieldN`       | packed bits within byte, MSB-first                                                     |
+| `dependsOn`       | `Option<T>` — conditionally encoded/decoded                                            |
+| `variableArray`   | `Vec<T>` — length from preceding count field                                           |
 
 To inspect the generated code:
 ```bash

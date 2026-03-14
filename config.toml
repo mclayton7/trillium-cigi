@@ -35,3 +35,13 @@ vfov_narrow_deg = 2.25
 jitter_freq_hz      = 10.0
 jitter_amplitude_deg = 0.05
 noise_floor_deg     = 0.01
+
+[platform_source]
+# "static" (default): use config values above, never updated.
+# "mavlink": receive real-time position/attitude from a MAVLink autopilot over UDP.
+platform_source      = static
+mavlink_listen_port  = 14550
+mavlink_system_id    = 0
+stanag_listen_port   = 4586
+stanag_multicast_group = "239.0.0.1"
+stanag_vehicle_id    = 0

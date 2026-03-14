@@ -8,8 +8,6 @@
 #[derive(Debug, Clone)]
 pub struct Config {
     // ── Network ──────────────────────────────────────────
-    /// UDP port to listen on (default 8008).
-    pub port: u16,
     /// TCP port to accept Trillium/Orion connections (default 8008).
     pub orion_listen_port: u16,
     /// IP address of the CIGI scene generator (default "127.0.0.1").
@@ -62,12 +60,25 @@ pub struct Config {
     pub jitter_amplitude: f32,
     /// White-noise floor (rad RMS). Default: ~0.01° ≈ 0.175 mrad.
     pub noise_floor: f32,
+
+    // ── Platform source ───────────────────────────────
+    /// Platform data source: "static" (default), "mavlink", or "stanag4586".
+    pub platform_source: String,
+    /// UDP port to listen for MAVLink telemetry (default 14550).
+    pub mavlink_listen_port: u16,
+    /// MAVLink system ID filter: 0 = accept all, 1-255 = specific vehicle.
+    pub mavlink_system_id: u8,
+    /// UDP port to join for STANAG 4586 multicast (default 4586).
+    pub stanag_listen_port: u16,
+    /// IPv4 multicast group for STANAG 4586 (default "239.0.0.1").
+    pub stanag_multicast_group: String,
+    /// STANAG 4586 Vehicle ID filter: 0 = accept all.
+    pub stanag_vehicle_id: i32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            port: 8008,
             orion_listen_port: 8008,
             scene_generator_ip: "127.0.0.1".to_string(),
             scene_generator_cigi_port: 8100,
@@ -90,6 +101,12 @@ impl Default for Config {
             jitter_freq: 10.0,
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
+            platform_source: "static".to_string(),
+            mavlink_listen_port: 14550,
+            mavlink_system_id: 0,
+            stanag_listen_port: 4586,
+            stanag_multicast_group: "239.0.0.1".to_string(),
+            stanag_vehicle_id: 0,
         }
     }
 }
@@ -110,9 +127,6 @@ impl Config {
             let key = key.trim();
             let val = val.trim();
             match key {
-                "port" => {
-                    if let Ok(v) = val.parse::<u16>() { cfg.port = v; }
-                }
                 "max_slew_rate_deg_s" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.max_slew_rate = v.to_radians(); }
                 }
@@ -178,6 +192,24 @@ impl Config {
                 }
                 "platform_yaw_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.platform_yaw = v.to_radians(); }
+                }
+                "platform_source" => {
+                    cfg.platform_source = val.trim_matches('"').to_string();
+                }
+                "mavlink_listen_port" => {
+                    if let Ok(v) = val.parse::<u16>() { cfg.mavlink_listen_port = v; }
+                }
+                "mavlink_system_id" => {
+                    if let Ok(v) = val.parse::<u8>() { cfg.mavlink_system_id = v; }
+                }
+                "stanag_listen_port" => {
+                    if let Ok(v) = val.parse::<u16>() { cfg.stanag_listen_port = v; }
+                }
+                "stanag_multicast_group" => {
+                    cfg.stanag_multicast_group = val.trim_matches('"').to_string();
+                }
+                "stanag_vehicle_id" => {
+                    if let Ok(v) = val.parse::<i32>() { cfg.stanag_vehicle_id = v; }
                 }
                 _ => {} // unknown keys silently ignored
             }
