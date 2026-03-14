@@ -138,3 +138,183 @@ pub fn lcg_noise_f32(seed: &mut u32) -> f32 {
     *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
     ((*seed >> 16) as f32 / 32768.0) - 1.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── lcg_noise_f32 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn lcg_noise_range() {
+        let mut seed = 0xABCD_1234u32;
+        for _ in 0..1000 {
+            let v = lcg_noise_f32(&mut seed);
+            assert!(v >= -1.0 && v <= 1.0, "out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn lcg_noise_deterministic() {
+        let mut s1 = 42u32;
+        let mut s2 = 42u32;
+        assert_eq!(lcg_noise_f32(&mut s1).to_bits(), lcg_noise_f32(&mut s2).to_bits());
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn lcg_noise_advances_seed() {
+        let mut seed = 1u32;
+        let before = seed;
+        lcg_noise_f32(&mut seed);
+        assert_ne!(seed, before);
+    }
+
+    // ── FaultState::tick ──────────────────────────────────────────────────
+
+    #[test]
+    fn tick_accumulates_uptime() {
+        let mut fs = FaultState::default();
+        assert_eq!(fs.uptime_secs, 0.0);
+        fs.tick(0.5);
+        assert!((fs.uptime_secs - 0.5).abs() < 1e-6);
+        fs.tick(1.5);
+        assert!((fs.uptime_secs - 2.0).abs() < 1e-6);
+    }
+
+    // ── inject / clear API ────────────────────────────────────────────────
+
+    #[test]
+    fn inject_and_clear_gps_loss() {
+        let mut fs = FaultState::default();
+        assert!(!fs.gps_loss);
+        fs.inject_gps_loss();
+        assert!(fs.gps_loss);
+        fs.clear_gps_loss();
+        assert!(!fs.gps_loss);
+    }
+
+    #[test]
+    fn inject_and_clear_motor_fault() {
+        let mut fs = FaultState::default();
+        fs.inject_motor_fault();
+        assert!(fs.motor_fault);
+        fs.clear_motor_fault();
+        assert!(!fs.motor_fault);
+    }
+
+    #[test]
+    fn inject_and_clear_imu_dropout() {
+        let mut fs = FaultState::default();
+        fs.inject_imu_dropout();
+        assert!(fs.imu_dropout);
+        fs.clear_imu_dropout();
+        assert!(!fs.imu_dropout);
+    }
+
+    #[test]
+    fn inject_and_clear_thermal() {
+        let mut fs = FaultState::default();
+        fs.inject_thermal();
+        assert!(fs.thermal_warning);
+        fs.clear_thermal();
+        assert!(!fs.thermal_warning);
+    }
+
+    #[test]
+    fn clear_all_resets_all_flags() {
+        let mut fs = FaultState::default();
+        fs.inject_gps_loss();
+        fs.inject_motor_fault();
+        fs.inject_imu_dropout();
+        fs.inject_thermal();
+        fs.clear_all();
+        assert!(!fs.gps_loss);
+        assert!(!fs.motor_fault);
+        assert!(!fs.imu_dropout);
+        assert!(!fs.thermal_warning);
+    }
+
+    // ── build_fault_packet ────────────────────────────────────────────────
+
+    #[test]
+    fn build_fault_packet_none_when_nominal() {
+        let fs = FaultState::default();
+        assert!(fs.build_fault_packet().is_none());
+    }
+
+    #[test]
+    fn build_fault_packet_motor_fault() {
+        let mut fs = FaultState::default();
+        fs.inject_motor_fault();
+        let pkt = fs.build_fault_packet().expect("expected fault packet");
+        assert!(matches!(pkt.type_, OrionFaultType::FaultTypeVelocityLimitExceeded));
+        assert!(matches!(pkt.level, OrionFaultLevel::FaultLevelError));
+    }
+
+    #[test]
+    fn build_fault_packet_non_motor_returns_none() {
+        let mut fs = FaultState::default();
+        fs.inject_gps_loss();
+        fs.inject_imu_dropout();
+        // Only motor_fault produces a packet; GPS/IMU do not
+        assert!(fs.build_fault_packet().is_none());
+    }
+
+    // ── build_diagnostics ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_diagnostics_nominal_voltages() {
+        let fs = FaultState::default();
+        let mut seed = 0u32;
+        let d = fs.build_diagnostics(&mut seed);
+        // Voltages should be near nominal (noise is tiny)
+        assert!((d.voltage24 - 24.0).abs() < 0.5, "v24={}", d.voltage24);
+        assert!((d.voltage12 - 12.0).abs() < 0.1, "v12={}", d.voltage12);
+        assert!((d.voltage3v3 - 3.3).abs() < 0.1, "v3v3={}", d.voltage3v3);
+    }
+
+    #[test]
+    fn build_diagnostics_motor_fault_voltage_sag() {
+        let mut fs = FaultState::default();
+        let mut seed = 42u32;
+        let nominal = fs.build_diagnostics(&mut seed).voltage24;
+        fs.inject_motor_fault();
+        let mut seed2 = 42u32;
+        let sagged = fs.build_diagnostics(&mut seed2).voltage24;
+        assert!(sagged < nominal - 1.0, "expected voltage sag: nominal={nominal} sagged={sagged}");
+    }
+
+    #[test]
+    fn build_diagnostics_thermal_crown_temp_rise() {
+        let mut fs = FaultState::default();
+        let mut seed = 0u32;
+        let baseline = fs.build_diagnostics(&mut seed).crown_temp;
+        fs.inject_thermal();
+        let mut seed2 = 0u32;
+        let hot = fs.build_diagnostics(&mut seed2).crown_temp;
+        assert!(hot > baseline + 20.0, "expected temp rise: baseline={baseline} hot={hot}");
+    }
+
+    #[test]
+    fn build_diagnostics_imu_dropout_gyro_temp_rise() {
+        let mut fs = FaultState::default();
+        let mut seed = 0u32;
+        let baseline = fs.build_diagnostics(&mut seed).gyro_temp;
+        fs.inject_imu_dropout();
+        let mut seed2 = 0u32;
+        let hot = fs.build_diagnostics(&mut seed2).gyro_temp;
+        assert!(hot > baseline + 10.0, "expected gyro temp rise: baseline={baseline} hot={hot}");
+    }
+
+    #[test]
+    fn build_diagnostics_warmup_cap() {
+        // After a very long uptime, temperature drift should be capped at 20°C
+        let mut fs = FaultState::default();
+        fs.uptime_secs = 10_000.0; // far past the 60 s warmup
+        let mut seed = 0u32;
+        let d = fs.build_diagnostics(&mut seed);
+        // crown_temp = 45 + 20 (cap) + noise*0.5 → should be ≤ 66
+        assert!(d.crown_temp < 67.0, "crown_temp={}", d.crown_temp);
+    }
+}

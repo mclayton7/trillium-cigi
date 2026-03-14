@@ -840,4 +840,162 @@ mod tests {
         let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
         assert!((len - 1.0).abs() < 1e-6, "quaternion not unit: len={}", len);
     }
+
+    // ── Geopoint mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn geopoint_mode_slews_toward_target() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeGeopoint;
+        // Platform at 35°N looking south at a target at 30°N (same longitude).
+        sim.pos_lat = 35.0_f64.to_radians();
+        sim.pos_lon = 0.0;
+        sim.pos_alt = 1000.0;
+        sim.geopoint_lat = 30.0_f64.to_radians();
+        sim.geopoint_lon = 0.0;
+        sim.geopoint_alt = 0.0;
+
+        sim.tick(0.5);
+
+        // Tilt should be positive (depression, + down convention) to reach a ground target.
+        assert!(sim.tilt > 0.0, "tilt should be positive (down), got {}", sim.tilt);
+    }
+
+    // ── Track mode ────────────────────────────────────────────────────────
+
+    #[test]
+    fn track_mode_proportional_controller() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        // Target offset: 0.2 to the right (positive pan offset)
+        sim.track_target = [0.2, 0.0];
+
+        let pan_before = sim.pan;
+        sim.tick(0.02);
+        assert!(sim.pan > pan_before, "pan should increase for rightward offset");
+    }
+
+    #[test]
+    fn track_mode_loss_at_fov_edge() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        // Target beyond 0.45 threshold → track loss
+        sim.track_target = [0.46, 0.0];
+
+        sim.tick(0.02);
+
+        assert!(!sim.track_active, "track should be lost when target exceeds threshold");
+    }
+
+    #[test]
+    fn track_mode_stays_active_below_threshold() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.4, 0.0]; // below 0.45
+
+        sim.tick(0.02);
+
+        assert!(sim.track_active, "track should remain active below threshold");
+    }
+
+    // ── Vibration ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn vibration_nonzero_after_tick() {
+        let mut sim = GimbalSimulator::default();
+        sim.tick(0.02);
+        // At least one of pan_jitter / tilt_jitter should be nonzero
+        assert!(
+            sim.pan_jitter != 0.0 || sim.tilt_jitter != 0.0,
+            "expected nonzero jitter"
+        );
+    }
+
+    #[test]
+    fn vibration_amplitude_scales_with_slew_rate() {
+        // Higher slew rate → higher jitter amplitude.
+        let mut sim_still = GimbalSimulator::default();
+        sim_still.noise_seed = 0xDEAD_BEEF;
+        sim_still.tick(0.02);
+        let still_jitter = sim_still.pan_jitter.abs();
+
+        let mut sim_fast = GimbalSimulator::default();
+        sim_fast.noise_seed = 0xDEAD_BEEF;
+        sim_fast.mode = OrionMode::OrionModeRate;
+        sim_fast.pan_rate_cmd = sim_fast.config.max_slew_rate;
+        sim_fast.tick(0.02);
+        let fast_jitter = sim_fast.pan_jitter.abs();
+
+        assert!(
+            fast_jitter >= still_jitter,
+            "fast jitter ({fast_jitter}) should be >= still jitter ({still_jitter})"
+        );
+    }
+
+    // ── Motor fault ───────────────────────────────────────────────────────
+
+    #[test]
+    fn motor_fault_stops_motion() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 1.0;
+        sim.faults.inject_motor_fault();
+        for _ in 0..10 {
+            sim.tick(0.02);
+        }
+        assert_eq!(sim.pan, 0.0, "motor fault: pan should not move");
+    }
+
+    // ── GPS loss ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn gps_loss_zeroes_position_in_telemetry() {
+        let mut sim = GimbalSimulator::default();
+        // Give the sim a non-zero position
+        sim.pos_lat = 0.5;
+        sim.pos_lon = 0.3;
+        sim.pos_alt = 200.0;
+        sim.faults.inject_gps_loss();
+        let telem = sim.to_sensor_extended_response();
+        assert_eq!(telem.entity_lat, 0.0, "GPS loss: entity_lat should be 0");
+        assert_eq!(telem.entity_lon, 0.0, "GPS loss: entity_lon should be 0");
+        assert_eq!(telem.entity_alt, 0.0, "GPS loss: entity_alt should be 0");
+    }
+
+    // ── Continuous pan shortest path ──────────────────────────────────────
+
+    #[test]
+    fn continuous_pan_shortest_path() {
+        use std::f32::consts::PI;
+        let mut cfg = Config::default();
+        cfg.pan_limit = std::f32::consts::TAU; // ≥ TAU-0.001 → is_continuous_pan() == true
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pan = PI; // currently at +π
+
+        // Commanded to -3.0 rad. The naive target would be -3.0, but shortest
+        // path from +π is to go to -3.0 + 2π ≈ +3.28 (just past +π going CCW is wrong;
+        // actually wrap_angle(-3.0 - π) is in (-π, π]).
+        let sc = crate::cigi::messages::SensorControl {
+            sensor_state: 1,
+            // Encode -3.0 rad as gain: g = (target/π + 1) * 0.5 = (-3/π + 1)*0.5
+            gain: ((-3.0_f32 / PI) + 1.0) * 0.5,
+            level: 0.5,
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+
+        // target_pan should be pan + wrap(raw - pan) = π + wrap(-3 - π)
+        let raw = -3.0_f32;
+        let delta = wrap_angle(raw - sim.pan); // needs to be in (-π, π]
+        let expected = PI + delta;
+        assert!(
+            (sim.target_pan - expected).abs() < 0.01,
+            "target_pan={} expected≈{}",
+            sim.target_pan,
+            expected
+        );
+    }
 }
