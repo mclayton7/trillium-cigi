@@ -1,123 +1,141 @@
-mod bridge;
 mod cigi;
 mod config;
 mod convert;
 mod faults;
 mod geo;
 mod orion;
-mod server;
+mod platform;
 mod simulator;
+mod trillium;
 
-use bridge::GimbalBridge;
+use std::time::{Duration, Instant};
+
 use config::Config;
-use server::{CigiPacket, CigiServer};
+use platform::PlatformState;
 use simulator::GimbalSimulator;
-use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+
+use cigi::host::{CigiResponse, build_datagram};
+use convert::to_cigi::{make_ig_control, orion_cmd_to_sensor_control, platform_to_entity_control};
+use convert::to_orion::sensor_response_to_telemetry;
+use orion::GeolocateTelemetryCorePacket;
+use orion::OrionCmdPacket;
+
+/// How long without a StartOfFrame before we declare the scene generator gone.
+const SG_TIMEOUT: Duration = Duration::from_secs(2);
+/// Platform entity ID used in EntityControl packets.
+const PLATFORM_ENTITY_ID: u16 = 1;
+/// Tick interval (50 Hz).
+const DT: f64 = 0.02;
 
 #[tokio::main]
 async fn main() {
-    // ── Configuration ─────────────────────────────────────────────────
     let cfg = Config::load("config.toml");
 
-    // ── CLI args ──────────────────────────────────────────────────────
-    // Usage: cigi_trillium [--gimbal-ip <host>] [--diag]
+    // ── CLI args ──────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
-    let gimbal_ip = find_arg(&args, "--gimbal-ip");
     let diag_enabled = args.contains(&"--diag".to_string());
 
-    // ── Simulator ─────────────────────────────────────────────────────
+    // ── Platform state (static from config for now) ───────────────────────
+    let platform = PlatformState::from_config(&cfg);
+
+    // ── Fallback simulator ────────────────────────────────────────────────
     let mut sim = GimbalSimulator::with_config(cfg.clone());
 
-    // ── Network ───────────────────────────────────────────────────────
-    let port = cfg.port;
-    let mut srv = CigiServer::new(port)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to bind UDP port {port}: {e}"));
+    // ── Channels ──────────────────────────────────────────────────────────
+    let (orion_cmd_tx, mut orion_cmd_rx) = mpsc::channel::<OrionCmdPacket>(32);
+    let (orion_telem_tx, orion_telem_rx) = mpsc::channel::<GeolocateTelemetryCorePacket>(4);
+    let (cigi_send_tx, cigi_send_rx) = mpsc::channel::<cigi::host::CigiDatagram>(8);
+    let (cigi_resp_tx, mut cigi_resp_rx) = mpsc::channel::<CigiResponse>(8);
 
-    // ── Optional TCP bridge to real gimbal ────────────────────────────
-    let mut bridge: Option<GimbalBridge> = gimbal_ip.map(|ip| GimbalBridge::new(&ip));
-    if let Some(ref mut b) = bridge {
-        if let Err(e) = b.connect().await {
-            eprintln!("[bridge] failed to connect: {e}  (continuing in sim-only mode)");
-            bridge = None;
-        }
-    }
+    // ── Spawn Trillium TCP server task ────────────────────────────────────
+    tokio::spawn(trillium::server::run(
+        cfg.clone(),
+        orion_cmd_tx,
+        orion_telem_rx,
+    ));
 
-    // ── Event loop ────────────────────────────────────────────────────
-    let mut tick = tokio::time::interval(Duration::from_millis(20)); // 50 Hz
+    // ── Spawn CIGI host UDP I/O task ──────────────────────────────────────
+    tokio::spawn(cigi::host::run(cfg.clone(), cigi_send_rx, cigi_resp_tx));
+
+    // ── Event loop ────────────────────────────────────────────────────────
+    let mut tick = tokio::time::interval(Duration::from_secs_f64(DT));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let mut frame_ctr: u32 = 0;
     let mut noise_seed: u32 = 0xCAFE_BABE;
+    let mut last_cmd: Option<OrionCmdPacket> = None;
+    let mut last_sof: Option<Instant> = None;
 
-    println!("CIGI Trillium Gimbal Simulator — UDP :{port}");
-    if bridge.is_some() {
-        println!("[bridge] TCP bridge active");
+    println!(
+        "CIGI Trillium Bridge — Trillium TCP :{} | CIGI UDP :{} → {}:{}",
+        cfg.orion_listen_port,
+        cfg.cigi_listen_port,
+        cfg.scene_generator_ip,
+        cfg.scene_generator_cigi_port,
+    );
+    if diag_enabled {
+        println!("[diag] diagnostics enabled at 1 Hz");
     }
-    println!("Send CIGI packets to this port to control the simulated gimbal.");
-    println!("  Options: --gimbal-ip <host>   proxy to real Orion over TCP");
-    println!("           --diag               log diagnostics at 1 Hz");
 
     loop {
         tokio::select! {
             biased;
 
+            // ── 50 Hz tick ────────────────────────────────────────────────
             _ = tick.tick() => {
-                // ── Tick simulator at 50 Hz ──────────────────────────
-                sim.tick(0.02);
                 frame_ctr = frame_ctr.wrapping_add(1);
+                let sg_connected = last_sof
+                    .map(|t| t.elapsed() < SG_TIMEOUT)
+                    .unwrap_or(false);
 
-                // ── Send IG→Host datagram (SOF + optional SER in one packet) ──
-                let mut msg = sim.to_start_of_frame().encode();
-                if frame_ctr % 5 == 0 {
-                    msg.extend_from_slice(&sim.to_sensor_extended_response().encode());
-                }
-                srv.send(&msg).await.ok();
+                if sg_connected {
+                    // ── Scene generator path ─────────────────────────────
+                    let ig = make_ig_control(frame_ctr);
+                    let ec = platform_to_entity_control(&platform, PLATFORM_ENTITY_ID);
+                    let sc = last_cmd.as_ref().map(orion_cmd_to_sensor_control);
+                    let datagram = build_datagram(&ig, &ec, sc.as_ref());
+                    cigi_send_tx.try_send(datagram).ok();
+                } else {
+                    // ── Simulator fallback ───────────────────────────────
+                    if let Some(ref cmd) = last_cmd {
+                        let sc = orion_cmd_to_sensor_control(cmd);
+                        sim.apply_sensor_control(&sc);
+                    }
+                    sim.tick(DT);
 
-                // ── Diagnostics at 1 Hz ──────────────────────────────
-                if diag_enabled && frame_ctr % 50 == 0 {
-                    let diag = sim.faults.build_diagnostics(&mut noise_seed);
-                    sim.faults.log_diagnostics(&diag);
-                }
+                    // Send synthetic telemetry at 10 Hz (every 5 ticks)
+                    if frame_ctr % 5 == 0 {
+                        let ser = sim.to_sensor_extended_response();
+                        let telem = sensor_response_to_telemetry(&ser, &platform);
+                        orion_telem_tx.try_send(telem).ok();
+                    }
 
-                // ── TCP bridge: reconnect if needed, apply real telemetry ──
-                if let Some(ref mut b) = bridge {
-                    b.try_reconnect().await;
-                    if let Some(telem) = b.recv_telemetry().await {
-                        sim.apply_hardware_telemetry(&telem);
+                    if diag_enabled && frame_ctr % 50 == 0 {
+                        let diag = sim.faults.build_diagnostics(&mut noise_seed);
+                        sim.faults.log_diagnostics(&diag);
                     }
                 }
             }
 
-            pkts = srv.recv_packets() => {
-                for pkt in pkts {
-                    match pkt {
-                        CigiPacket::SensorControl(ref sc) => {
-                            sim.apply_sensor_control(sc);
-                            // Forward to real gimbal if bridge is active.
-                            if let Some(ref mut b) = bridge {
-                                let cmd = convert::to_orion::sensor_control_to_orion_cmd(sc);
-                                b.send_cmd(&cmd).await.ok();
-                            }
-                        }
-                        CigiPacket::EntityControl(ref ec) => {
-                            sim.apply_entity_control(ec);
-                        }
-                        CigiPacket::IgControl(igc) => {
-                            sim.ig_mode = igc.ig_mode;
-                            sim.host_frame_ctr = igc.frame_ctr;
-                        }
-                        CigiPacket::Unknown => {}
+            // ── Orion command from Trillium ───────────────────────────────
+            Some(cmd) = orion_cmd_rx.recv() => {
+                last_cmd = Some(cmd);
+            }
+
+            // ── CIGI response from scene generator ───────────────────────
+            Some(resp) = cigi_resp_rx.recv() => {
+                match resp {
+                    CigiResponse::StartOfFrame(_sof) => {
+                        last_sof = Some(Instant::now());
+                    }
+                    CigiResponse::SensorResponse(ser) => {
+                        let telem = sensor_response_to_telemetry(&ser, &platform);
+                        orion_telem_tx.try_send(telem).ok();
                     }
                 }
             }
         }
     }
-}
-
-/// Find the value after a named CLI argument, e.g. `--gimbal-ip 192.168.1.10`.
-fn find_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
 }

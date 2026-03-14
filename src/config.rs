@@ -10,6 +10,28 @@ pub struct Config {
     // ── Network ──────────────────────────────────────────
     /// UDP port to listen on (default 8008).
     pub port: u16,
+    /// TCP port to accept Trillium/Orion connections (default 8008).
+    pub orion_listen_port: u16,
+    /// IP address of the CIGI scene generator (default "127.0.0.1").
+    pub scene_generator_ip: String,
+    /// UDP port of the CIGI scene generator (default 8100).
+    pub scene_generator_cigi_port: u16,
+    /// UDP port to receive CIGI responses from the scene generator (default 8101).
+    pub cigi_listen_port: u16,
+
+    // ── Platform position/attitude ───────────────────────
+    /// Platform latitude (rad).
+    pub platform_lat: f64,
+    /// Platform longitude (rad).
+    pub platform_lon: f64,
+    /// Platform altitude (m).
+    pub platform_alt: f64,
+    /// Platform roll (rad).
+    pub platform_roll: f32,
+    /// Platform pitch (rad).
+    pub platform_pitch: f32,
+    /// Platform yaw (rad).
+    pub platform_yaw: f32,
 
     // ── Kinematics ───────────────────────────────────────
     /// Maximum slew rate (rad/s). Default: 60 °/s.
@@ -46,6 +68,16 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: 8008,
+            orion_listen_port: 8008,
+            scene_generator_ip: "127.0.0.1".to_string(),
+            scene_generator_cigi_port: 8100,
+            cigi_listen_port: 8101,
+            platform_lat: 0.0,
+            platform_lon: 0.0,
+            platform_alt: 0.0,
+            platform_roll: 0.0,
+            platform_pitch: 0.0,
+            platform_yaw: 0.0,
             max_slew_rate: 60.0_f32.to_radians(),
             max_accel: 300.0_f32.to_radians(),
             pan_limit: 170.0_f32.to_radians(),
@@ -116,6 +148,36 @@ impl Config {
                 }
                 "noise_floor_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.noise_floor = v.to_radians(); }
+                }
+                "orion_listen_port" => {
+                    if let Ok(v) = val.parse::<u16>() { cfg.orion_listen_port = v; }
+                }
+                "scene_generator_ip" => {
+                    cfg.scene_generator_ip = val.trim_matches('"').to_string();
+                }
+                "scene_generator_cigi_port" => {
+                    if let Ok(v) = val.parse::<u16>() { cfg.scene_generator_cigi_port = v; }
+                }
+                "cigi_listen_port" => {
+                    if let Ok(v) = val.parse::<u16>() { cfg.cigi_listen_port = v; }
+                }
+                "platform_lat_deg" => {
+                    if let Ok(v) = val.parse::<f64>() { cfg.platform_lat = v.to_radians(); }
+                }
+                "platform_lon_deg" => {
+                    if let Ok(v) = val.parse::<f64>() { cfg.platform_lon = v.to_radians(); }
+                }
+                "platform_alt_m" => {
+                    if let Ok(v) = val.parse::<f64>() { cfg.platform_alt = v; }
+                }
+                "platform_roll_deg" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.platform_roll = v.to_radians(); }
+                }
+                "platform_pitch_deg" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.platform_pitch = v.to_radians(); }
+                }
+                "platform_yaw_deg" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.platform_yaw = v.to_radians(); }
                 }
                 _ => {} // unknown keys silently ignored
             }

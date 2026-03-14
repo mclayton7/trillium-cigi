@@ -1,9 +1,21 @@
-# CIGI Trillium Gimbal Simulator — Runtime Configuration
-# All angles in degrees; rates in deg/s or deg/s².
+# CIGI Trillium Bridge — Runtime Configuration
+# All angles in degrees; rates in deg/s or deg/s²; altitudes in metres.
 # Lines starting with '#' or '[section]' headers are ignored.
 
 [network]
 port = 8008
+orion_listen_port = 8008
+scene_generator_ip = "127.0.0.1"
+scene_generator_cigi_port = 8100
+cigi_listen_port = 8101
+
+[platform]
+platform_lat_deg   = 0.0
+platform_lon_deg   = 0.0
+platform_alt_m     = 0.0
+platform_roll_deg  = 0.0
+platform_pitch_deg = 0.0
+platform_yaw_deg   = 0.0
 
 [kinematics]
 max_slew_rate_deg_s = 60.0
