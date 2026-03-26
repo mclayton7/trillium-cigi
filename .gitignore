@@ -1,1 +1,11 @@
 /target
+.DS_Store
+.idea/
+*.iml
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.class
+*.jar
