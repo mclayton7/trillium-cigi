@@ -350,6 +350,13 @@ impl GimbalSimulator {
         }
 
         // ── Motion (disabled when motor fault is active) ───────────
+        // Thermal throttling: halve effective slew rate when thermal warning is active.
+        let effective_slew_rate = if self.faults.thermal_warning {
+            self.config.max_slew_rate * 0.5
+        } else {
+            self.config.max_slew_rate
+        };
+
         if !self.faults.motor_fault {
             match self.mode {
                 OrionMode::OrionModePosition
@@ -359,7 +366,7 @@ impl GimbalSimulator {
                         &mut self.pan_rate,
                         self.target_pan,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                     tick_axis_trap(
@@ -367,15 +374,18 @@ impl GimbalSimulator {
                         &mut self.tilt_rate,
                         self.target_tilt,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                 }
 
                 OrionMode::OrionModeRate => {
+                    // Clamp commanded rate to effective slew rate.
+                    let pan_cmd = self.pan_rate_cmd.clamp(-effective_slew_rate, effective_slew_rate);
+                    let tilt_cmd = self.tilt_rate_cmd.clamp(-effective_slew_rate, effective_slew_rate);
                     // Ramp actual rate toward commanded rate, limited by max_accel.
-                    self.pan_rate = ramp_rate(self.pan_rate, self.pan_rate_cmd, self.config.max_accel, dt);
-                    self.tilt_rate = ramp_rate(self.tilt_rate, self.tilt_rate_cmd, self.config.max_accel, dt);
+                    self.pan_rate = ramp_rate(self.pan_rate, pan_cmd, self.config.max_accel, dt);
+                    self.tilt_rate = ramp_rate(self.tilt_rate, tilt_cmd, self.config.max_accel, dt);
 
                     // Integrate actual (ramped) rate into position.
                     self.pan += self.pan_rate * dt;
@@ -399,7 +409,7 @@ impl GimbalSimulator {
                         &mut self.pan_rate,
                         self.target_pan,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                     tick_axis_trap(
@@ -407,7 +417,7 @@ impl GimbalSimulator {
                         &mut self.tilt_rate,
                         self.target_tilt,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                 }
@@ -580,17 +590,39 @@ impl GimbalSimulator {
 impl GimbalSimulator {
     /// Build an Orion `GeolocateTelemetryCorePacket` from current state.
     pub fn to_telemetry(&self) -> GeolocateTelemetryCorePacket {
+        // We need a local copy of the noise seed for degraded GPS noise.
+        // This avoids requiring &mut self while keeping deterministic output
+        // per frame (seeded from the simulator's noise_seed snapshot).
+        let mut noise_seed = self.noise_seed;
+
         let mut pkt = GeolocateTelemetryCorePacket::default();
 
         pkt.system_time = self.system_time_ms;
-        pkt.pos_lat = if self.faults.gps_loss { 0.0 } else { self.pos_lat };
-        pkt.pos_lon = if self.faults.gps_loss { 0.0 } else { self.pos_lon };
-        pkt.pos_alt = if self.faults.gps_loss { 0.0 } else { self.pos_alt };
+        if self.faults.gps_loss {
+            pkt.pos_lat = 0.0;
+            pkt.pos_lon = 0.0;
+            pkt.pos_alt = 0.0;
+        } else if self.faults.degraded_gps {
+            let std = self.faults.gps_noise_std;
+            pkt.pos_lat = self.pos_lat + lcg_noise_f32(&mut noise_seed) as f64 * std;
+            pkt.pos_lon = self.pos_lon + lcg_noise_f32(&mut noise_seed) as f64 * std;
+            pkt.pos_alt = self.pos_alt + lcg_noise_f32(&mut noise_seed) as f64 * std;
+        } else {
+            pkt.pos_lat = self.pos_lat;
+            pkt.pos_lon = self.pos_lon;
+            pkt.pos_alt = self.pos_alt;
+        }
 
-        // Report jitter-perturbed pan/tilt (pre-computed in tick()).
-        // Normalise to (−π, π] so the wire value is always in range.
-        pkt.pan = wrap_angle(self.pan_jittered);
-        pkt.tilt = self.tilt_jittered;
+        // Encoder fault: report frozen pan/tilt instead of actual values.
+        if self.faults.encoder_fault {
+            pkt.pan = wrap_angle(self.faults.frozen_pan);
+            pkt.tilt = self.faults.frozen_tilt;
+        } else {
+            // Report jitter-perturbed pan/tilt (pre-computed in tick()).
+            // Normalise to (−π, π] so the wire value is always in range.
+            pkt.pan = wrap_angle(self.pan_jittered);
+            pkt.tilt = self.tilt_jittered;
+        }
         pkt.hfov = self.hfov;
         pkt.vfov = self.vfov;
         pkt.mode = self.mode;
@@ -1284,6 +1316,164 @@ mod tests {
         assert!(
             (sim_clean.pan_jittered - sim_clean.pan).abs() < 1e-9,
             "zero-jitter sim: pan_jittered should equal pan"
+        );
+    }
+
+    // ── Degraded GPS ──────────────────────────────────────────────────────
+
+    #[test]
+    fn degraded_gps_adds_noise_to_position() {
+        let mut sim = GimbalSimulator::default();
+        sim.pos_lat = 0.5;
+        sim.pos_lon = -1.0;
+        sim.pos_alt = 500.0;
+        sim.tick(0.02); // ensure noise_seed is advanced
+
+        sim.faults.inject_degraded_gps(0.001);
+        let telem = sim.to_telemetry();
+
+        // Position should be close to true but not exact.
+        assert!(
+            (telem.pos_lat - 0.5).abs() < 0.01,
+            "degraded GPS: lat should be near true value, got {}",
+            telem.pos_lat
+        );
+        assert!(
+            (telem.pos_lat - 0.5).abs() > 1e-12,
+            "degraded GPS: lat should have noise"
+        );
+        assert!(telem.pos_alt != 0.0, "degraded GPS: alt should not be zero");
+    }
+
+    #[test]
+    fn degraded_gps_does_not_zero_position() {
+        let mut sim = GimbalSimulator::default();
+        sim.pos_lat = 0.5;
+        sim.pos_lon = -1.0;
+        sim.pos_alt = 500.0;
+        sim.faults.inject_degraded_gps(0.0001);
+        let telem = sim.to_telemetry();
+
+        // Unlike gps_loss, positions should NOT be zero.
+        assert!(telem.pos_lat != 0.0);
+        assert!(telem.pos_lon != 0.0);
+        assert!(telem.pos_alt != 0.0);
+    }
+
+    // ── Encoder fault ─────────────────────────────────────────────────────
+
+    #[test]
+    fn encoder_fault_freezes_reported_pan_tilt() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 1.0;
+        sim.target_tilt = 0.5;
+
+        // Move the gimbal partway.
+        for _ in 0..5 {
+            sim.tick(0.02);
+        }
+        let frozen_pan = sim.pan;
+        let frozen_tilt = sim.tilt;
+
+        // Inject encoder fault at current position.
+        sim.faults.inject_encoder_fault(frozen_pan, frozen_tilt);
+
+        // Continue moving internally.
+        for _ in 0..50 {
+            sim.tick(0.02);
+        }
+
+        // Internal state should have moved.
+        assert!(
+            (sim.pan - frozen_pan).abs() > 0.01,
+            "internal pan should have moved: pan={} frozen={}",
+            sim.pan, frozen_pan
+        );
+
+        // Telemetry should still report frozen values.
+        let telem = sim.to_telemetry();
+        assert!(
+            (telem.pan - wrap_angle(frozen_pan)).abs() < 1e-4,
+            "reported pan={} should be frozen at {}",
+            telem.pan, frozen_pan
+        );
+        assert!(
+            (telem.tilt - frozen_tilt).abs() < 1e-4,
+            "reported tilt={} should be frozen at {}",
+            telem.tilt, frozen_tilt
+        );
+    }
+
+    #[test]
+    fn encoder_fault_clear_resumes_reporting() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 1.0;
+        sim.faults.inject_encoder_fault(0.0, 0.0);
+
+        for _ in 0..50 {
+            sim.tick(0.02);
+        }
+
+        sim.faults.clear_encoder_fault();
+        sim.tick(0.02);
+        let telem = sim.to_telemetry();
+
+        // After clearing, reported pan should match actual (jittered) pan.
+        assert!(
+            (telem.pan - wrap_angle(sim.pan_jittered)).abs() < 1e-4,
+            "after clear: reported pan={} should match actual={}",
+            telem.pan, sim.pan_jittered
+        );
+    }
+
+    // ── Thermal throttling ────────────────────────────────────────────────
+
+    #[test]
+    fn thermal_throttle_reduces_slew_rate() {
+        // Two identical simulators: one with thermal warning, one without.
+        let mut sim_normal = GimbalSimulator::default();
+        sim_normal.mode = OrionMode::OrionModePosition;
+        sim_normal.target_pan = 1.0;
+
+        let mut sim_hot = GimbalSimulator::default();
+        sim_hot.mode = OrionMode::OrionModePosition;
+        sim_hot.target_pan = 1.0;
+        sim_hot.faults.inject_thermal();
+
+        // Run both for the same time.
+        for _ in 0..20 {
+            sim_normal.tick(0.02);
+            sim_hot.tick(0.02);
+        }
+
+        // The throttled sim should have moved less.
+        assert!(
+            sim_hot.pan < sim_normal.pan,
+            "thermal throttle: hot pan={} should be less than normal pan={}",
+            sim_hot.pan, sim_normal.pan
+        );
+    }
+
+    #[test]
+    fn thermal_throttle_limits_rate_mode() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeRate;
+        sim.pan_rate_cmd = sim.config.max_slew_rate; // full speed command
+        sim.faults.inject_thermal();
+
+        // Run until rate settles.
+        for _ in 0..200 {
+            sim.tick(0.02);
+        }
+
+        // Rate should be clamped to half of max_slew_rate.
+        let half_max = sim.config.max_slew_rate * 0.5;
+        assert!(
+            (sim.pan_rate - half_max).abs() < 0.01,
+            "thermal throttle rate mode: pan_rate={} should be near half_max={}",
+            sim.pan_rate, half_max
         );
     }
 }
