@@ -98,6 +98,8 @@ pub struct Config {
     pub track_d_gain: f32,
     /// Track loss threshold (fractional FOV, 0–1). Default: 0.45.
     pub track_loss_threshold: f32,
+    /// Physical size of tracked target (metres). Default: 2.0.
+    pub track_target_size_m: f32,
 
     // ── Platform source ───────────────────────────────
     /// Platform data source: "static" (default), "mavlink", or "stanag4586".
@@ -153,6 +155,7 @@ impl Default for Config {
             track_gate_size_deg: 1.0,
             track_d_gain: 0.5,
             track_loss_threshold: 0.45,
+            track_target_size_m: 2.0,
             platform_source: "static".to_string(),
             mavlink_listen_port: 14550,
             mavlink_system_id: 0,
@@ -242,6 +245,9 @@ impl Config {
                 }
                 "track_loss_threshold" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.track_loss_threshold = v.clamp(0.0, 1.0); }
+                }
+                "track_target_size_m" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.track_target_size_m = v.max(0.01); }
                 }
                 "track_gate_size_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.track_gate_size_deg = v.max(0.01); }

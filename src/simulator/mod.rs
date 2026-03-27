@@ -455,6 +455,23 @@ impl GimbalSimulator {
                         {
                             self.track_active = false;
                         }
+                        // Track loss when confidence drops below 0.3
+                        // (target too small to resolve at current range/zoom).
+                        if self.track_active {
+                            let offset_mag = (self.track_target[0].powi(2) + self.track_target[1].powi(2)).sqrt();
+                            let offset_fraction = offset_mag / self.config.track_loss_threshold;
+                            let angular_size = if self.slant_range_m > 1.0 {
+                                self.config.track_target_size_m as f64 / self.slant_range_m
+                            } else {
+                                0.5
+                            };
+                            let min_resolvable = self.hfov * 0.005;
+                            let size_factor = (angular_size as f32 / min_resolvable).min(1.0);
+                            let confidence = (0.95 * (1.0 - offset_fraction.powi(2)) * size_factor).clamp(0.0, 1.0);
+                            if confidence < 0.3 {
+                                self.track_active = false;
+                            }
+                        }
                     }
                     // Update previous track offsets for next derivative.
                     self.prev_track_x = self.track_target[0];
@@ -692,10 +709,30 @@ impl GimbalSimulator {
         // Track data.
         if matches!(self.mode, OrionMode::OrionModeTrack) {
             pkt.has_track_data = 1;
+
+            // Dynamic target size (normalized to FOV).
+            let angular_size = if self.slant_range_m > 1.0 {
+                self.config.track_target_size_m as f64 / self.slant_range_m
+            } else {
+                0.5 // fallback when no valid range
+            };
+            let size = (angular_size as f32 / self.hfov).clamp(0.01, 0.5);
+
+            // Dynamic confidence based on offset, range, and resolvability.
+            let offset_mag = (self.track_target[0].powi(2) + self.track_target[1].powi(2)).sqrt();
+            let offset_fraction = offset_mag / self.config.track_loss_threshold;
+            let min_resolvable = self.hfov * 0.005; // half percent of FOV
+            let size_factor = (angular_size as f32 / min_resolvable).min(1.0);
+            let confidence = if self.track_active {
+                (0.95 * (1.0 - offset_fraction.powi(2)) * size_factor).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
             pkt.primary_track_data = Some(PrimaryTrackData {
                 pos: self.track_target,
-                size: 0.05,
-                confidence: if self.track_active { 0.9 } else { 0.0 },
+                size,
+                confidence,
                 coasting: if self.track_active { 0 } else { 1 },
                 active: self.track_active as u32,
             });
@@ -1168,10 +1205,13 @@ mod tests {
 
     #[test]
     fn track_mode_stays_active_below_threshold() {
-        let mut sim = GimbalSimulator::default();
+        let mut cfg = Config::default();
+        cfg.platform_alt = 1000.0; // elevated so ray-cast yields valid slant range
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pos_alt = 1000.0;
         sim.mode = OrionMode::OrionModeTrack;
         sim.track_active = true;
-        sim.track_target = [0.4, 0.0]; // below 0.45
+        sim.track_target = [0.1, 0.0]; // well within 0.45 threshold
 
         sim.tick(0.02);
 
@@ -1231,21 +1271,25 @@ mod tests {
         // With a higher threshold, an offset of 0.46 should NOT cause track loss.
         let mut cfg = Config::default();
         cfg.track_loss_threshold = 0.5;
+        cfg.platform_alt = 1000.0;
         let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pos_alt = 1000.0;
         sim.mode = OrionMode::OrionModeTrack;
         sim.track_active = true;
-        sim.track_target = [0.46, 0.0];
+        sim.track_target = [0.1, 0.0]; // well within 0.5 threshold
 
         sim.tick(0.02);
         assert!(sim.track_active, "track should stay active with higher threshold");
 
-        // With a lower threshold, an offset of 0.3 should cause track loss.
+        // With a lower threshold, an offset of 0.3 should cause track loss (FOV-edge).
         let mut cfg2 = Config::default();
         cfg2.track_loss_threshold = 0.25;
+        cfg2.platform_alt = 1000.0;
         let mut sim2 = GimbalSimulator::with_config(cfg2);
+        sim2.pos_alt = 1000.0;
         sim2.mode = OrionMode::OrionModeTrack;
         sim2.track_active = true;
-        sim2.track_target = [0.3, 0.0];
+        sim2.track_target = [0.3, 0.0]; // exceeds 0.25 threshold
 
         sim2.tick(0.02);
         assert!(!sim2.track_active, "track should be lost with lower threshold");
@@ -1704,5 +1748,91 @@ mod tests {
         // 100.0 / 0.1 * 640 = 640000 → clamped to 640
         assert_eq!(sr.gate_x_size, 640, "gate_x_size should clamp to 640");
         assert_eq!(sr.gate_y_size, 640, "gate_y_size should clamp to 640");
+    }
+
+    // ── Dynamic track confidence and target size ─────────────────────────
+
+    #[test]
+    fn track_data_short_range_high_confidence_large_size() {
+        // At 100m slant range with default 2m target size, angular size is large.
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.0, 0.0]; // centered
+        sim.slant_range_m = 100.0;
+
+        let telem = sim.to_telemetry();
+        let td = telem.primary_track_data.as_ref().unwrap();
+
+        // angular_size = 2.0 / 100.0 = 0.02 rad; hfov_wide ~ 0.5236 rad
+        // size = 0.02 / 0.5236 ~ 0.038 → clamped above 0.01
+        assert!(td.size > 0.01, "size should be above minimum: {}", td.size);
+        // Confidence should be high (centered target, large angular size).
+        assert!(td.confidence > 0.8, "confidence should be high at short range: {}", td.confidence);
+    }
+
+    #[test]
+    fn track_data_long_range_low_size_reduced_confidence() {
+        // At 50km, 2m target is tiny: angular_size = 2/50000 = 0.00004 rad.
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.0, 0.0];
+        sim.slant_range_m = 50_000.0;
+
+        let telem = sim.to_telemetry();
+        let td = telem.primary_track_data.as_ref().unwrap();
+
+        // size = 0.00004 / 0.5236 ~ 0.00008 → clamped to 0.01
+        assert!((td.size - 0.01).abs() < 1e-6, "size should clamp to min at long range: {}", td.size);
+        // size_factor = 0.00004 / (0.5236 * 0.005) ~ 0.015 → very low
+        // confidence = 0.95 * 1.0 * 0.015 ~ 0.014 → low
+        assert!(td.confidence < 0.3, "confidence should be low at extreme range: {}", td.confidence);
+    }
+
+    #[test]
+    fn track_data_near_fov_edge_low_confidence() {
+        // Target near the edge of the FOV should have lower confidence.
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.slant_range_m = 100.0; // short range for good size_factor
+        sim.track_target = [0.4, 0.0]; // near threshold (0.45)
+
+        let telem = sim.to_telemetry();
+        let td = telem.primary_track_data.as_ref().unwrap();
+
+        // offset_fraction = 0.4 / 0.45 ~ 0.889
+        // (1 - 0.889^2) ~ 0.210
+        // confidence ~ 0.95 * 0.210 * size_factor
+        assert!(td.confidence < 0.5, "confidence should be low near FOV edge: {}", td.confidence);
+
+        // Compare with centered target at same range.
+        let mut sim_center = GimbalSimulator::default();
+        sim_center.mode = OrionMode::OrionModeTrack;
+        sim_center.track_active = true;
+        sim_center.slant_range_m = 100.0;
+        sim_center.track_target = [0.0, 0.0];
+
+        let telem_center = sim_center.to_telemetry();
+        let td_center = telem_center.primary_track_data.as_ref().unwrap();
+        assert!(td_center.confidence > td.confidence,
+            "centered target should have higher confidence: {} vs {}",
+            td_center.confidence, td.confidence);
+    }
+
+    #[test]
+    fn track_loss_triggered_by_low_confidence() {
+        // At extreme range, target is unresolvable → confidence < 0.3 → track loss.
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.0, 0.0]; // centered, so FOV-edge threshold won't trigger
+        sim.slant_range_m = 50_000.0; // extreme range
+
+        sim.tick(0.02);
+
+        assert!(!sim.track_active,
+            "track should be lost when confidence < 0.3 at extreme range");
     }
 }
