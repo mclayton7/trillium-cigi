@@ -76,6 +76,11 @@ pub struct Config {
     /// Enable atmospheric refraction correction for LOS ray-cast. Default: true.
     pub refraction_enabled: bool,
 
+    // ── Terrain ─────────────────────────────────────────────
+    /// Uniform terrain elevation above WGS84 ellipsoid (metres). Default: 0.0.
+    /// Raises the effective intersection surface for LOS ray-cast without needing DEM files.
+    pub terrain_elevation_m: f64,
+
     // ── Geopoint ──────────────────────────────────────────
     /// Default target altitude (metres) for geopoint mode. Default: 0.0.
     pub geopoint_alt_m: f64,
@@ -135,6 +140,7 @@ impl Default for Config {
             noise_floor: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
             refraction_enabled: true,
+            terrain_elevation_m: 0.0,
             geopoint_alt_m: 0.0,
             track_p_gain: 3.0,
             track_d_gain: 0.5,
@@ -210,6 +216,9 @@ impl Config {
                         "false" | "0" => cfg.refraction_enabled = false,
                         _ => {}
                     }
+                }
+                "terrain_elevation_m" => {
+                    if let Ok(v) = val.parse::<f64>() { cfg.terrain_elevation_m = v.max(0.0); }
                 }
                 "geopoint_alt_m" => {
                     if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }

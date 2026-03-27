@@ -479,6 +479,7 @@ impl GimbalSimulator {
             self.config.stabilization_quality,
             self.pan_jittered, self.tilt_jittered,
             self.config.refraction_enabled,
+            self.config.terrain_elevation_m,
         ) {
             self.look_lat = ll;
             self.look_lon = lo;

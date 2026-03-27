@@ -122,12 +122,16 @@ pub fn los_ecef(
 // ─────────────────────────────────────────── Ray-cast ──
 
 /// Find where a ray from `origin` (ECEF, metres) in direction `dir` (unit vector)
-/// intersects the WGS84 ellipsoid.  Returns the closer positive-t intersection.
-pub fn ray_wgs84(origin: [f64; 3], dir: [f64; 3]) -> Option<[f64; 3]> {
+/// intersects an ellipsoid raised by `terrain_elevation_m` above the WGS84 surface.
+/// With `terrain_elevation_m = 0.0` this is the standard WGS84 ellipsoid intersection.
+/// Returns the closer positive-t intersection as `[lat_rad, lon_rad, alt_m]`.
+pub fn ray_wgs84(origin: [f64; 3], dir: [f64; 3], terrain_elevation_m: f64) -> Option<[f64; 3]> {
     let [ox, oy, oz] = origin;
     let [dx, dy, dz] = dir;
-    let a2 = A * A;
-    let b2 = B * B;
+    let a_eff = A + terrain_elevation_m;
+    let b_eff = B + terrain_elevation_m;
+    let a2 = a_eff * a_eff;
+    let b2 = b_eff * b_eff;
     let qa = (dx * dx + dy * dy) / a2 + dz * dz / b2;
     let qb = 2.0 * ((ox * dx + oy * dy) / a2 + oz * dz / b2);
     let qc = (ox * ox + oy * oy) / a2 + oz * oz / b2 - 1.0;
@@ -177,6 +181,7 @@ pub fn compute_look_point(
     pan: f32,
     tilt: f32,
     refraction_enabled: bool,
+    terrain_elevation_m: f64,
 ) -> Option<[f64; 3]> {
     if pos_alt < 1.0 {
         return None; // on the ground, no look-point
@@ -203,7 +208,7 @@ pub fn compute_look_point(
         return None;
     }
     let dir_n = [dir[0] / len, dir[1] / len, dir[2] / len];
-    ray_wgs84(origin, dir_n)
+    ray_wgs84(origin, dir_n, terrain_elevation_m)
 }
 
 /// Inverse geolocation: compute the pan/tilt angles needed to point at
@@ -297,7 +302,7 @@ mod tests {
         let lat = 37.0_f64.to_radians();
         let lon = -122.0_f64.to_radians();
         let alt = 1000.0;
-        let result = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, false);
+        let result = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, false, 0.0);
         let [rl, ro, ra] = result.expect("should intersect");
         assert!((rl - lat).abs() < 1e-5, "look lat should match platform lat");
         assert!((ro - lon).abs() < 1e-5, "look lon should match platform lon");
@@ -312,7 +317,7 @@ mod tests {
         // Compute look point forward and to the right
         let pan0 = 0.5_f32;
         let tilt0 = 0.7_f32; // 40° depression
-        if let Some([tl, to, ta]) = compute_look_point(pos_lat, pos_lon, pos_alt, 0.0, 0.0, 0.0, 0.0, pan0, tilt0, false) {
+        if let Some([tl, to, ta]) = compute_look_point(pos_lat, pos_lon, pos_alt, 0.0, 0.0, 0.0, 0.0, pan0, tilt0, false, 0.0) {
             let (pan1, tilt1) = inverse_geopoint(pos_lat, pos_lon, pos_alt, 0.0, tl, to, ta);
             assert!((pan1 - pan0).abs() < 0.01, "pan inverse: {} vs {}", pan1, pan0);
             assert!((tilt1 - tilt0).abs() < 0.01, "tilt inverse: {} vs {}", tilt1, tilt0);
@@ -349,9 +354,9 @@ mod tests {
         let pan = 0.5_f32;
         let tilt = 0.7_f32;
 
-        let result_no_rp = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 0.0, pan, tilt, false);
+        let result_no_rp = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 0.0, pan, tilt, false, 0.0);
         // Non-zero roll/pitch but stab_quality = 0.0 → should be identical
-        let result_with_rp = compute_look_point(lat, lon, alt, yaw, 0.2, -0.1, 0.0, pan, tilt, false);
+        let result_with_rp = compute_look_point(lat, lon, alt, yaw, 0.2, -0.1, 0.0, pan, tilt, false, 0.0);
         let a = result_no_rp.expect("should intersect");
         let b = result_with_rp.expect("should intersect");
         assert!((a[0] - b[0]).abs() < 1e-10, "lat should match: {} vs {}", a[0], b[0]);
@@ -370,10 +375,10 @@ mod tests {
         let pan = 0.0_f32;
         let tilt = std::f32::consts::FRAC_PI_4; // 45° depression
 
-        let result_no_roll = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt, false);
+        let result_no_roll = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt, false, 0.0);
         // Apply 10° roll
         let roll = 10.0_f32.to_radians();
-        let result_with_roll = compute_look_point(lat, lon, alt, yaw, roll, 0.0, 1.0, pan, tilt, false);
+        let result_with_roll = compute_look_point(lat, lon, alt, yaw, roll, 0.0, 1.0, pan, tilt, false, 0.0);
 
         let a = result_no_roll.expect("should intersect");
         let b = result_with_roll.expect("should intersect");
@@ -394,9 +399,9 @@ mod tests {
         let pan = 0.0_f32;
         let tilt = std::f32::consts::FRAC_PI_4;
 
-        let result_no_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt, false);
+        let result_no_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt, false, 0.0);
         let pitch = 5.0_f32.to_radians();
-        let result_with_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, pitch, 1.0, pan, tilt, false);
+        let result_with_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, pitch, 1.0, pan, tilt, false, 0.0);
 
         let a = result_no_pitch.expect("should intersect");
         let b = result_with_pitch.expect("should intersect");
@@ -416,11 +421,11 @@ mod tests {
         let pan = 0.0_f32;
         let tilt = std::f32::consts::FRAC_PI_4;
 
-        let base = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false)
+        let base = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0)
             .expect("intersect");
-        let half = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 0.5, pan, tilt, false)
+        let half = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 0.5, pan, tilt, false, 0.0)
             .expect("intersect");
-        let full = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 1.0, pan, tilt, false)
+        let full = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 1.0, pan, tilt, false, 0.0)
             .expect("intersect");
 
         let shift_half = (base[0] - half[0]).abs() + (base[1] - half[1]).abs();
@@ -439,9 +444,9 @@ mod tests {
         let pan = 0.0_f32; // looking north
         let tilt = 0.05_f32; // very shallow depression (~2.9°)
 
-        let without = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false)
+        let without = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0)
             .expect("should intersect without refraction");
-        let with = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, true)
+        let with = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, true, 0.0)
             .expect("should intersect with refraction");
 
         // Refraction reduces effective depression → ray hits ground further away.
@@ -464,15 +469,15 @@ mod tests {
         let pan = 0.3_f32;
         let tilt = 0.5_f32;
 
-        let a = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false);
-        let b = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false);
+        let a = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0);
+        let b = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0);
         assert_eq!(a, b, "two calls with refraction disabled should be identical");
 
         // Also verify refraction enabled at steep angle produces negligible difference.
         let steep_tilt = std::f32::consts::FRAC_PI_2; // 90° straight down
-        let steep_off = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, steep_tilt, false)
+        let steep_off = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, steep_tilt, false, 0.0)
             .expect("intersect");
-        let steep_on = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, steep_tilt, true)
+        let steep_on = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, steep_tilt, true, 0.0)
             .expect("intersect");
         let dlat = (steep_off[0] - steep_on[0]).abs();
         let dlon = (steep_off[1] - steep_on[1]).abs();
@@ -494,5 +499,64 @@ mod tests {
         let r_45 = bennett_refraction(std::f64::consts::FRAC_PI_4);
         assert!(r_45 < 0.001, "refraction at 45° should be < 1 mrad: {}", r_45);
         assert!(r_45 >= 0.0, "refraction should never be negative");
+    }
+
+    #[test]
+    fn terrain_elevation_zero_matches_original() {
+        // With terrain_elevation_m = 0.0, results should be identical to the
+        // original WGS84 intersection.
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 1000.0;
+        let pan = 0.3_f32;
+        let tilt = 0.7_f32;
+
+        let a = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0);
+        let b = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0);
+        assert_eq!(a, b, "terrain_elevation=0.0 should be deterministic");
+    }
+
+    #[test]
+    fn terrain_elevation_raises_intersection_altitude() {
+        // With terrain_elevation_m = 500.0, the intersection point should
+        // have an altitude near 500 m (the raised ellipsoid surface).
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 2000.0; // platform at 2 km
+        let tilt = std::f32::consts::FRAC_PI_2; // straight down
+
+        let result_0 = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, tilt, false, 0.0)
+            .expect("should intersect at terrain=0");
+        let result_500 = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, tilt, false, 500.0)
+            .expect("should intersect at terrain=500");
+
+        // At terrain=0, altitude should be near 0.
+        assert!(result_0[2].abs() < 10.0,
+            "terrain=0 look-point altitude should be near 0: {}", result_0[2]);
+        // At terrain=500, altitude should be near 500.
+        assert!((result_500[2] - 500.0).abs() < 10.0,
+            "terrain=500 look-point altitude should be near 500: {}", result_500[2]);
+    }
+
+    #[test]
+    fn terrain_elevation_shortens_slant_range() {
+        // Looking at an angle, higher terrain should produce a closer (shorter range)
+        // intersection point — the lat/lon should be closer to the platform.
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 5000.0;
+        let pan = 0.0_f32; // looking north
+        let tilt = 0.5_f32; // moderate depression
+
+        let result_0 = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 0.0)
+            .expect("should intersect");
+        let result_1000 = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false, 1000.0)
+            .expect("should intersect");
+
+        // Higher terrain → intersection is closer → less lat displacement from platform.
+        let dlat_0 = (result_0[0] - lat).abs();
+        let dlat_1000 = (result_1000[0] - lat).abs();
+        assert!(dlat_1000 < dlat_0,
+            "higher terrain should shorten range: dlat_0={} vs dlat_1000={}", dlat_0, dlat_1000);
     }
 }
