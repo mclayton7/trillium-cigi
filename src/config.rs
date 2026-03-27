@@ -45,6 +45,7 @@ pub struct Config {
 
     // ── Camera ───────────────────────────────────────────
     /// Wide-angle horizontal FOV (rad). Default: 30°.
+    /// Also serves as camera 0 wide HFOV (backward compat).
     pub hfov_wide: f32,
     /// Wide-angle vertical FOV (rad). Default: 22.5°.
     pub vfov_wide: f32,
@@ -52,6 +53,10 @@ pub struct Config {
     pub hfov_narrow: f32,
     /// Narrow (zoom) vertical FOV (rad). Default: 2.25°.
     pub vfov_narrow: f32,
+
+    /// Per-camera FOV table: `[(hfov_wide_deg, vfov_wide_deg, hfov_narrow_deg, vfov_narrow_deg); 3]`.
+    /// Index 0 = EO wide, 1 = EO narrow, 2 = IR.  Stored in **degrees**.
+    pub camera_table: [(f32, f32, f32, f32); 3],
 
     // ── Vibration ────────────────────────────────────────
     /// Sinusoidal jitter frequency (Hz). Default: 10 Hz.
@@ -98,6 +103,11 @@ impl Default for Config {
             vfov_wide: 22.5_f32.to_radians(),
             hfov_narrow: 3.0_f32.to_radians(),
             vfov_narrow: 2.25_f32.to_radians(),
+            camera_table: [
+                (30.0, 22.5, 3.0, 2.25),   // cam 0: EO wide
+                (5.0, 3.75, 0.5, 0.375),    // cam 1: EO narrow
+                (20.0, 15.0, 2.0, 1.5),     // cam 2: IR
+            ],
             jitter_freq: 10.0,
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
@@ -211,9 +221,64 @@ impl Config {
                 "stanag_vehicle_id" => {
                     if let Ok(v) = val.parse::<i32>() { cfg.stanag_vehicle_id = v; }
                 }
-                _ => {} // unknown keys silently ignored
+                _ => {
+                    // Per-camera FOV keys: camera_N_hfov_wide_deg, etc.
+                    if let Some(rest) = key.strip_prefix("camera_") {
+                        // Parse camera index (single digit)
+                        if let Some((idx_str, field)) = rest.split_once('_') {
+                            if let Ok(idx) = idx_str.parse::<usize>() {
+                                if idx < 3 {
+                                    if let Ok(v) = val.parse::<f32>() {
+                                        match field {
+                                            "hfov_wide_deg" => cfg.camera_table[idx].0 = v,
+                                            "vfov_wide_deg" => cfg.camera_table[idx].1 = v,
+                                            "hfov_narrow_deg" => cfg.camera_table[idx].2 = v,
+                                            "vfov_narrow_deg" => cfg.camera_table[idx].3 = v,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+        // Sync camera_table[0] with the legacy hfov/vfov fields.
+        // If any camera_0_* key was also set, it wins (parsed after legacy keys
+        // only when it appears later in the file, but we reconcile here by
+        // checking whether camera_table[0] was changed from default).
+        // Strategy: legacy keys always write camera_table[0] as well.
+        // We already parsed them above into hfov_wide etc., so just copy.
+        // But if camera_0_* keys were explicitly set they'll have overwritten
+        // camera_table[0] already. To keep it simple: after all parsing,
+        // if camera_table[0] still equals the compiled-in default AND the
+        // legacy fields differ from compiled-in default, copy legacy → table[0].
+        let def = Config::default();
+        let default_cam0 = def.camera_table[0];
+        if cfg.camera_table[0] == default_cam0 {
+            let legacy_cam0 = (
+                cfg.hfov_wide.to_degrees(),
+                cfg.vfov_wide.to_degrees(),
+                cfg.hfov_narrow.to_degrees(),
+                cfg.vfov_narrow.to_degrees(),
+            );
+            let def_legacy = (
+                def.hfov_wide.to_degrees(),
+                def.vfov_wide.to_degrees(),
+                def.hfov_narrow.to_degrees(),
+                def.vfov_narrow.to_degrees(),
+            );
+            if legacy_cam0 != def_legacy {
+                cfg.camera_table[0] = legacy_cam0;
+            }
+        }
+        // Also sync back: hfov_wide/narrow etc. from camera_table[0] so
+        // fov_at_zoom() uses the right values for the active camera 0.
+        cfg.hfov_wide = cfg.camera_table[0].0.to_radians();
+        cfg.vfov_wide = cfg.camera_table[0].1.to_radians();
+        cfg.hfov_narrow = cfg.camera_table[0].2.to_radians();
+        cfg.vfov_narrow = cfg.camera_table[0].3.to_radians();
         cfg
     }
 
@@ -233,19 +298,39 @@ impl Config {
     }
 }
 
-/// Per-camera FOV table (index 0 = EO wide, 1 = EO narrow, 2 = IR).
-pub const CAMERA_TABLE: &[(f32, f32)] = &[
-    (30.0, 22.5),  // cam 0: EO wide
-    (5.0,  3.75),  // cam 1: EO narrow
-    (20.0, 15.0),  // cam 2: IR
-];
+impl Config {
+    /// Look up `(hfov_deg, vfov_deg)` wide-end FOV for a camera index.
+    /// Falls back to camera 0 for out-of-range indices.
+    pub fn camera_fov(&self, index: i8) -> (f32, f32) {
+        let i = index.max(0) as usize;
+        let entry = if i < self.camera_table.len() {
+            self.camera_table[i]
+        } else {
+            self.camera_table[0]
+        };
+        (entry.0, entry.1)
+    }
 
-/// Look up (hfov_deg, vfov_deg) for a camera index. Falls back to cam 0.
+    /// HFOV/VFOV interpolated by zoom level for a specific camera.
+    /// zoom 0 = wide end, 1 = narrow end.  Returns radians.
+    pub fn fov_at_zoom_for_camera(&self, camera: i8, zoom: f32) -> (f32, f32) {
+        let i = camera.max(0) as usize;
+        let entry = if i < self.camera_table.len() {
+            self.camera_table[i]
+        } else {
+            self.camera_table[0]
+        };
+        let t = zoom.clamp(0.0, 1.0);
+        let hfov = entry.0 + t * (entry.2 - entry.0);
+        let vfov = entry.1 + t * (entry.3 - entry.1);
+        (hfov.to_radians(), vfov.to_radians())
+    }
+}
+
+/// Legacy free function — delegates to default config.
+/// Prefer `Config::camera_fov()` for per-config camera tables.
 pub fn camera_fov(index: i8) -> (f32, f32) {
-    CAMERA_TABLE
-        .get(index.max(0) as usize)
-        .copied()
-        .unwrap_or(CAMERA_TABLE[0])
+    Config::default().camera_fov(index)
 }
 
 #[cfg(test)]
@@ -445,21 +530,105 @@ mod tests {
 
     #[test]
     fn camera_fov_index_0() {
-        assert_eq!(camera_fov(0), (30.0, 22.5));
+        let cfg = Config::default();
+        assert_eq!(cfg.camera_fov(0), (30.0, 22.5));
     }
 
     #[test]
     fn camera_fov_index_1() {
-        assert_eq!(camera_fov(1), (5.0, 3.75));
+        let cfg = Config::default();
+        assert_eq!(cfg.camera_fov(1), (5.0, 3.75));
     }
 
     #[test]
     fn camera_fov_index_2() {
-        assert_eq!(camera_fov(2), (20.0, 15.0));
+        let cfg = Config::default();
+        assert_eq!(cfg.camera_fov(2), (20.0, 15.0));
     }
 
     #[test]
     fn camera_fov_out_of_range_falls_back_to_cam0() {
-        assert_eq!(camera_fov(99), CAMERA_TABLE[0]);
+        let cfg = Config::default();
+        assert_eq!(cfg.camera_fov(99), cfg.camera_fov(0));
+    }
+
+    #[test]
+    fn camera_fov_free_function_uses_defaults() {
+        // Legacy free function should still work with default values.
+        assert_eq!(camera_fov(0), (30.0, 22.5));
+        assert_eq!(camera_fov(1), (5.0, 3.75));
+        assert_eq!(camera_fov(2), (20.0, 15.0));
+    }
+
+    // ── per-camera config ────────────────────────────────────────────────────
+
+    #[test]
+    fn per_camera_fov_from_config_file() {
+        let content = concat!(
+            "camera_0_hfov_wide_deg = 46.8\n",
+            "camera_0_vfov_wide_deg = 35.1\n",
+            "camera_0_hfov_narrow_deg = 1.2\n",
+            "camera_0_vfov_narrow_deg = 0.9\n",
+            "camera_2_hfov_wide_deg = 29.0\n",
+            "camera_2_vfov_wide_deg = 21.75\n",
+            "camera_2_hfov_narrow_deg = 3.0\n",
+            "camera_2_vfov_narrow_deg = 2.25\n",
+        );
+        let path = write_temp("per_camera_fov", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        // Camera 0 should use the per-camera values.
+        assert_eq!(cfg.camera_fov(0), (46.8, 35.1));
+        // Camera 1 should still have defaults (not overridden).
+        assert_eq!(cfg.camera_fov(1), (5.0, 3.75));
+        // Camera 2 should use the per-camera values.
+        assert_eq!(cfg.camera_fov(2), (29.0, 21.75));
+    }
+
+    #[test]
+    fn per_camera_zoom_interpolation() {
+        let content = concat!(
+            "camera_2_hfov_wide_deg = 29.0\n",
+            "camera_2_vfov_wide_deg = 21.75\n",
+            "camera_2_hfov_narrow_deg = 3.0\n",
+            "camera_2_vfov_narrow_deg = 2.25\n",
+        );
+        let path = write_temp("per_camera_zoom", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        // Zoom 0 → wide end
+        let (h, v) = cfg.fov_at_zoom_for_camera(2, 0.0);
+        assert!((h - 29.0_f32.to_radians()).abs() < 1e-5);
+        assert!((v - 21.75_f32.to_radians()).abs() < 1e-5);
+
+        // Zoom 1 → narrow end
+        let (h, v) = cfg.fov_at_zoom_for_camera(2, 1.0);
+        assert!((h - 3.0_f32.to_radians()).abs() < 1e-5);
+        assert!((v - 2.25_f32.to_radians()).abs() < 1e-5);
+
+        // Zoom 0.5 → midpoint
+        let (h, _) = cfg.fov_at_zoom_for_camera(2, 0.5);
+        let expected: f32 = (29.0 + 3.0) / 2.0;
+        assert!((h - expected.to_radians()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn legacy_keys_sync_to_camera_table_0() {
+        // Legacy hfov_wide_deg etc. should update camera_table[0].
+        let content = concat!(
+            "hfov_wide_deg = 50.0\n",
+            "vfov_wide_deg = 37.5\n",
+            "hfov_narrow_deg = 5.0\n",
+            "vfov_narrow_deg = 3.75\n",
+        );
+        let path = write_temp("legacy_cam0_sync", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.camera_fov(0), (50.0, 37.5));
+        // hfov_wide should also be in radians matching camera_table[0]
+        assert!((cfg.hfov_wide - 50.0_f32.to_radians()).abs() < 1e-5);
     }
 }

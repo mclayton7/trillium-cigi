@@ -17,7 +17,7 @@
 use std::f32::consts::PI;
 
 use crate::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse, StartOfFrame};
-use crate::config::{Config, camera_fov};
+use crate::config::Config;
 use crate::faults::{FaultState, lcg_noise_f32};
 use crate::geo;
 use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
@@ -309,14 +309,14 @@ impl GimbalSimulator {
         let new_zoom = zoom.clamp(0.0, 1.0);
         if (new_zoom - self.zoom_level).abs() > 0.001 {
             self.zoom_level = new_zoom;
-            let (h, v) = self.config.fov_at_zoom(self.zoom_level);
+            let (h, v) = self.config.fov_at_zoom_for_camera(self.camera_index, self.zoom_level);
             self.hfov = h;
             self.vfov = v;
         }
     }
 
     fn update_camera_fov(&mut self) {
-        let (h_deg, v_deg) = camera_fov(self.camera_index);
+        let (h_deg, v_deg) = self.config.camera_fov(self.camera_index);
         self.hfov = h_deg.to_radians();
         self.vfov = v_deg.to_radians();
     }
