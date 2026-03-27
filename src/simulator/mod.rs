@@ -116,6 +116,10 @@ pub struct GimbalSimulator {
     pub pan_jittered: f32,
     pub tilt_jittered: f32,
 
+    // ── Settling ──────────────────────────────────────────────────────
+    /// True when the gimbal has reached its commanded position (within tolerance).
+    pub settled: bool,
+
     // ── Diagnostics / faults ────────────────────────────────────────
     pub faults: FaultState,
 
@@ -174,6 +178,7 @@ impl Default for GimbalSimulator {
             track_active: false,
             prev_track_x: 0.0,
             prev_track_y: 0.0,
+            settled: false,
             jitter_phase: 0.0,
             noise_seed: 0xDEAD_BEEF,
             pan_jitter: 0.0,
@@ -489,6 +494,17 @@ impl GimbalSimulator {
             self.tilt_rate = 0.0;
         }
 
+        // ── Settled detection ──────────────────────────────────────
+        self.settled = match self.mode {
+            OrionMode::OrionModePosition
+            | OrionMode::OrionModeGeopoint
+            | OrionMode::OrionModePositionNoLimits => {
+                (self.pan - self.target_pan).abs() < 0.01
+                    && (self.tilt - self.target_tilt).abs() < 0.01
+            }
+            _ => false,
+        };
+
         // ── Vibration & jitter ────────────────────────────────────
         self.jitter_phase =
             (self.jitter_phase + self.config.jitter_freq * dt) % 1.0;
@@ -748,7 +764,7 @@ impl GimbalSimulator {
     pub fn to_sensor_extended_response(&self) -> SensorExtendedResponse {
         let telem = self.to_telemetry();
         let mut resp =
-            crate::convert::to_cigi::telemetry_to_sensor_extended_response(&telem, 0, 0);
+            crate::convert::to_cigi::telemetry_to_sensor_extended_response(&telem, 0, 0, self.settled);
 
         // Override entity position with computed look-point.
         // During camera switch blackout, report NaN-equivalent (0,0,0).

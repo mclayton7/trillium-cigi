@@ -13,12 +13,13 @@ pub fn telemetry_to_sensor_extended_response(
     telem: &GeolocateTelemetryCorePacket,
     view_id: u16,
     sensor_id: u8,
+    settled: bool,
 ) -> SensorExtendedResponse {
     let deg = 180.0 / std::f64::consts::PI;
     SensorExtendedResponse {
         view_id,
         sensor_id,
-        sensor_status: orion_mode_to_sensor_status(telem.mode),
+        sensor_status: orion_mode_to_sensor_status(telem.mode, settled),
         // Default gate size; overridden by GimbalSimulator::to_sensor_extended_response()
         // with a value computed from the current FOV and track_gate_size_deg config.
         gate_x_size: 20,
@@ -34,11 +35,16 @@ pub fn telemetry_to_sensor_extended_response(
     }
 }
 
-fn orion_mode_to_sensor_status(mode: OrionMode) -> u8 {
+fn orion_mode_to_sensor_status(mode: OrionMode, settled: bool) -> u8 {
     match mode {
-        OrionMode::OrionModeDisabled | OrionMode::OrionModeFault => 3, // Breaklock
+        OrionMode::OrionModePosition
+        | OrionMode::OrionModeGeopoint
+        | OrionMode::OrionModePositionNoLimits => {
+            if settled { 0 } else { 2 } // Locked vs Slewing
+        }
+        OrionMode::OrionModeRate => 2,                                 // Slewing
         OrionMode::OrionModeTrack => 1,                                // Tracking
-        _ => 0,                                                        // Searching/Active
+        _ => 3,                                                        // Breaklock
     }
 }
 
@@ -155,7 +161,7 @@ mod tests {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pan = PI32 / 4.0;
         t.tilt = -PI32 / 6.0;
-        let r = telemetry_to_sensor_extended_response(&t, 0, 0);
+        let r = telemetry_to_sensor_extended_response(&t, 0, 0, false);
         // Per CIGI v3.3, gate positions are image-plane centroids, not pan/tilt.
         // The base conversion sets them to 0.0 (bore-sighted); the simulator
         // overrides them for track mode in to_sensor_extended_response().
@@ -168,7 +174,7 @@ mod tests {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pos_lat = PI64 / 2.0;
         t.pos_lon = -PI64 / 4.0;
-        let r = telemetry_to_sensor_extended_response(&t, 0, 0);
+        let r = telemetry_to_sensor_extended_response(&t, 0, 0, false);
         assert!((r.entity_lat - 90.0).abs() < 1e-10, "entity_lat={}", r.entity_lat);
         assert!((r.entity_lon - (-45.0)).abs() < 1e-10, "entity_lon={}", r.entity_lon);
     }
@@ -177,48 +183,64 @@ mod tests {
     fn telem_alt_passes_through() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pos_alt = 1234.5;
-        let r = telemetry_to_sensor_extended_response(&t, 0, 0);
+        let r = telemetry_to_sensor_extended_response(&t, 0, 0, false);
         assert!((r.entity_alt - 1234.5).abs() < 1e-9);
     }
 
     #[test]
     fn telem_view_and_sensor_id_passed_through() {
-        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 7, 3);
+        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 7, 3, false);
         assert_eq!(r.view_id, 7);
         assert_eq!(r.sensor_id, 3);
     }
 
     #[test]
-    fn telem_sensor_status_track() {
+    fn telem_sensor_status_track_active() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.mode = OrionMode::OrionModeTrack;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).sensor_status, 1);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false).sensor_status, 1);
     }
 
     #[test]
     fn telem_sensor_status_disabled() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.mode = OrionMode::OrionModeDisabled;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).sensor_status, 3);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false).sensor_status, 3);
     }
 
     #[test]
-    fn telem_sensor_status_position() {
+    fn telem_sensor_status_position_settled() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.mode = OrionMode::OrionModePosition;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).sensor_status, 0);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, true).sensor_status, 0);
+    }
+
+    #[test]
+    fn telem_sensor_status_position_slewing() {
+        let mut t = GeolocateTelemetryCorePacket::default();
+        t.mode = OrionMode::OrionModePosition;
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false).sensor_status, 2);
+    }
+
+    #[test]
+    fn telem_sensor_status_rate_always_slewing() {
+        let mut t = GeolocateTelemetryCorePacket::default();
+        t.mode = OrionMode::OrionModeRate;
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false).sensor_status, 2);
+        // Even if settled flag is true, rate mode is always slewing.
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, true).sensor_status, 2);
     }
 
     #[test]
     fn telem_frame_ctr_from_system_time() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.system_time = 9876;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).frame_ctr, 9876);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false).frame_ctr, 9876);
     }
 
     #[test]
     fn telem_gate_sizes_are_20() {
-        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 0, 0);
+        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 0, 0, false);
         assert_eq!(r.gate_x_size, 20);
         assert_eq!(r.gate_y_size, 20);
     }
