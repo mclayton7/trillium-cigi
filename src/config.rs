@@ -92,6 +92,8 @@ pub struct Config {
     // ── Track mode ──────────────────────────────────────────
     /// Proportional gain for track-mode controller. Default: 3.0.
     pub track_p_gain: f32,
+    /// Angular extent of the tracking gate in degrees. Default: 1.0.
+    pub track_gate_size_deg: f32,
     /// Derivative gain for track-mode controller. Default: 0.5.
     pub track_d_gain: f32,
     /// Track loss threshold (fractional FOV, 0–1). Default: 0.45.
@@ -148,6 +150,7 @@ impl Default for Config {
             laser_max_range_m: 20000.0,
             geopoint_alt_m: 0.0,
             track_p_gain: 3.0,
+            track_gate_size_deg: 1.0,
             track_d_gain: 0.5,
             track_loss_threshold: 0.45,
             platform_source: "static".to_string(),
@@ -239,6 +242,9 @@ impl Config {
                 }
                 "track_loss_threshold" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.track_loss_threshold = v.clamp(0.0, 1.0); }
+                }
+                "track_gate_size_deg" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.track_gate_size_deg = v.max(0.01); }
                 }
                 "orion_listen_port" => {
                     if let Ok(v) = val.parse::<u16>() { cfg.orion_listen_port = v; }

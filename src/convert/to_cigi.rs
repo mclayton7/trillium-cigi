@@ -19,6 +19,8 @@ pub fn telemetry_to_sensor_extended_response(
         view_id,
         sensor_id,
         sensor_status: orion_mode_to_sensor_status(telem.mode),
+        // Default gate size; overridden by GimbalSimulator::to_sensor_extended_response()
+        // with a value computed from the current FOV and track_gate_size_deg config.
         gate_x_size: 20,
         gate_y_size: 20,
         gate_x_pos: 0.0,

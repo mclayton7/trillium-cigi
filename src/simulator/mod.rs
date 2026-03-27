@@ -726,6 +726,14 @@ impl GimbalSimulator {
             resp.entity_alt = 0.0;
         }
 
+        // Compute gate size from FOV and configured tracking gate angular size.
+        const SENSOR_RESOLUTION: u16 = 640;
+        let gate_px = (self.config.track_gate_size_deg / self.hfov.to_degrees()
+            * SENSOR_RESOLUTION as f32) as u16;
+        let gate_px = gate_px.clamp(1, SENSOR_RESOLUTION);
+        resp.gate_x_size = gate_px;
+        resp.gate_y_size = gate_px;
+
         // Per CIGI v3.3, gate_x_pos/gate_y_pos are the tracking gate centroid
         // position on the image plane, not gimbal pan/tilt angles.
         // In track mode, use the fractional track target offsets (-0.5 to +0.5).
@@ -1638,5 +1646,63 @@ mod tests {
             RangeDataSrc::RangeSrcNone,
             "expected no laser source when beyond max range"
         );
+    }
+
+    // ── Gate size from zoom ──────────────────────────────────────────────
+
+    #[test]
+    fn gate_size_default_zoom_wide_fov() {
+        // Default config: hfov_wide = 30 deg, track_gate_size_deg = 1.0
+        // gate_px = 1.0 / 30.0 * 640 ≈ 21
+        let sim = GimbalSimulator::default();
+        let sr = sim.to_sensor_extended_response();
+        assert_eq!(sr.gate_x_size, 21, "gate_x_size at wide FOV");
+        assert_eq!(sr.gate_y_size, 21, "gate_y_size at wide FOV");
+    }
+
+    #[test]
+    fn gate_size_full_zoom_narrow_fov() {
+        // Default config: hfov_narrow = 3 deg, track_gate_size_deg = 1.0
+        // gate_px = 1.0 / 3.0 * 640 ≈ 213
+        let mut cfg = Config::default();
+        cfg.track_gate_size_deg = 1.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        // Set zoom to 1.0 (full narrow)
+        let sc = crate::cigi::messages::SensorControl {
+            sensor_state: 1,
+            ac_coupling: 1.0, // zoom = 1.0
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+        sim.tick(0.02);
+        let sr = sim.to_sensor_extended_response();
+        assert_eq!(sr.gate_x_size, 213, "gate_x_size at narrow FOV");
+        assert_eq!(sr.gate_y_size, 213, "gate_y_size at narrow FOV");
+    }
+
+    #[test]
+    fn gate_size_clamped_minimum() {
+        // With a very large FOV relative to gate size, result should clamp to 1.
+        let mut cfg = Config::default();
+        cfg.track_gate_size_deg = 0.01;
+        cfg.hfov_wide = 90.0_f32.to_radians();
+        let sim = GimbalSimulator::with_config(cfg);
+        let sr = sim.to_sensor_extended_response();
+        // 0.01 / 90.0 * 640 ≈ 0.07 → clamped to 1
+        assert_eq!(sr.gate_x_size, 1, "gate_x_size should clamp to 1");
+        assert_eq!(sr.gate_y_size, 1, "gate_y_size should clamp to 1");
+    }
+
+    #[test]
+    fn gate_size_clamped_maximum() {
+        // With a very small FOV relative to gate size, result should clamp to 640.
+        let mut cfg = Config::default();
+        cfg.track_gate_size_deg = 100.0;
+        cfg.hfov_wide = 0.1_f32.to_radians();
+        let sim = GimbalSimulator::with_config(cfg);
+        let sr = sim.to_sensor_extended_response();
+        // 100.0 / 0.1 * 640 = 640000 → clamped to 640
+        assert_eq!(sr.gate_x_size, 640, "gate_x_size should clamp to 640");
+        assert_eq!(sr.gate_y_size, 640, "gate_y_size should clamp to 640");
     }
 }
