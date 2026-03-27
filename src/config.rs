@@ -81,6 +81,10 @@ pub struct Config {
     /// Raises the effective intersection surface for LOS ray-cast without needing DEM files.
     pub terrain_elevation_m: f64,
 
+    // ── Laser rangefinder ──────────────────────────────────
+    /// Maximum effective laser rangefinder range (metres). Default: 20000.0.
+    pub laser_max_range_m: f64,
+
     // ── Geopoint ──────────────────────────────────────────
     /// Default target altitude (metres) for geopoint mode. Default: 0.0.
     pub geopoint_alt_m: f64,
@@ -141,6 +145,7 @@ impl Default for Config {
             stabilization_quality: 0.0,
             refraction_enabled: true,
             terrain_elevation_m: 0.0,
+            laser_max_range_m: 20000.0,
             geopoint_alt_m: 0.0,
             track_p_gain: 3.0,
             track_d_gain: 0.5,
@@ -219,6 +224,9 @@ impl Config {
                 }
                 "terrain_elevation_m" => {
                     if let Ok(v) = val.parse::<f64>() { cfg.terrain_elevation_m = v.max(0.0); }
+                }
+                "laser_max_range_m" => {
+                    if let Ok(v) = val.parse::<f64>() { cfg.laser_max_range_m = v.max(0.0); }
                 }
                 "geopoint_alt_m" => {
                     if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }

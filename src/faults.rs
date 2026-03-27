@@ -38,6 +38,9 @@ pub struct FaultState {
     /// Standard deviation of Gaussian-like noise added when degraded_gps is active.
     pub gps_noise_std: f64,
 
+    /// Laser rangefinder fault — disables laser range source in telemetry.
+    pub laser_fault: bool,
+
     /// Encoder fault — freeze reported pan/tilt at injection-time values.
     pub encoder_fault: bool,
     /// Frozen pan angle captured at encoder fault injection (rad).
@@ -81,6 +84,9 @@ impl FaultState {
         self.gps_noise_std = 0.0;
     }
 
+    pub fn inject_laser_fault(&mut self) { self.laser_fault = true; }
+    pub fn clear_laser_fault(&mut self)  { self.laser_fault = false; }
+
     /// Inject encoder fault: freeze reported pan/tilt at the given angles.
     /// The simulator control loop continues normally; only telemetry is
     /// affected.
@@ -102,6 +108,7 @@ impl FaultState {
         self.thermal_warning = false;
         self.degraded_gps = false;
         self.gps_noise_std = 0.0;
+        self.laser_fault = false;
         self.encoder_fault = false;
         self.frozen_pan = 0.0;
         self.frozen_tilt = 0.0;
@@ -301,6 +308,16 @@ mod tests {
     }
 
     #[test]
+    fn inject_and_clear_laser_fault() {
+        let mut fs = FaultState::default();
+        assert!(!fs.laser_fault);
+        fs.inject_laser_fault();
+        assert!(fs.laser_fault);
+        fs.clear_laser_fault();
+        assert!(!fs.laser_fault);
+    }
+
+    #[test]
     fn inject_and_clear_encoder_fault() {
         let mut fs = FaultState::default();
         assert!(!fs.encoder_fault);
@@ -322,6 +339,7 @@ mod tests {
         fs.inject_imu_dropout();
         fs.inject_thermal();
         fs.inject_degraded_gps(0.01);
+        fs.inject_laser_fault();
         fs.inject_encoder_fault(1.0, 2.0);
         fs.clear_all();
         assert!(!fs.gps_loss);
@@ -330,6 +348,7 @@ mod tests {
         assert!(!fs.thermal_warning);
         assert!(!fs.degraded_gps);
         assert_eq!(fs.gps_noise_std, 0.0);
+        assert!(!fs.laser_fault);
         assert!(!fs.encoder_fault);
         assert_eq!(fs.frozen_pan, 0.0);
         assert_eq!(fs.frozen_tilt, 0.0);

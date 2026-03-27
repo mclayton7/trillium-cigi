@@ -20,7 +20,7 @@ use crate::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse
 use crate::config::Config;
 use crate::faults::{FaultState, lcg_noise_f32};
 use crate::geo;
-use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
+use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData, RangeDataSrc};
 
 // ─────────────────────────────────────────── constants (kept for tests) ──
 
@@ -79,6 +79,12 @@ pub struct GimbalSimulator {
     pub platform_pitch: f32,   // radians
     pub platform_yaw: f32,     // radians (heading)
     pub vel_ned: [f32; 3],     // m/s, NED
+
+    // ── Laser rangefinder ────────────────────────────────────────────
+    /// Slant range from platform to look-point (metres). 0.0 when no look-point.
+    pub slant_range_m: f64,
+    /// Whether the laser rangefinder is enabled.
+    pub laser_enabled: bool,
 
     // ── Geolocation ─────────────────────────────────────────────────
     /// Computed look-point (where LOS hits Earth), radians / metres.
@@ -156,6 +162,8 @@ impl Default for GimbalSimulator {
             platform_pitch: 0.0,
             platform_yaw: 0.0,
             vel_ned: [0.0; 3],
+            slant_range_m: 0.0,
+            laser_enabled: true,
             look_lat: 0.0,
             look_lon: 0.0,
             look_alt: 0.0,
@@ -494,6 +502,16 @@ impl GimbalSimulator {
             self.look_lat = ll;
             self.look_lon = lo;
             self.look_alt = la;
+
+            // Slant range: Euclidean distance in ECEF between platform and look-point.
+            let platform_ecef = geo::geodetic_to_ecef(self.pos_lat, self.pos_lon, self.pos_alt);
+            let look_ecef = geo::geodetic_to_ecef(ll, lo, la);
+            self.slant_range_m = ((platform_ecef[0] - look_ecef[0]).powi(2)
+                + (platform_ecef[1] - look_ecef[1]).powi(2)
+                + (platform_ecef[2] - look_ecef[2]).powi(2))
+            .sqrt();
+        } else {
+            self.slant_range_m = 0.0;
         }
 
         // ── Timing ───────────────────────────────────────────────
@@ -661,6 +679,15 @@ impl GimbalSimulator {
             self.pan,
             self.tilt,
         );
+
+        // Laser rangefinder.
+        if self.laser_enabled
+            && !self.faults.laser_fault
+            && self.slant_range_m > 0.0
+            && self.slant_range_m <= self.config.laser_max_range_m
+        {
+            pkt.range_source = RangeDataSrc::RangeSrcLaser;
+        }
 
         // Track data.
         if matches!(self.mode, OrionMode::OrionModeTrack) {
@@ -1520,6 +1547,96 @@ mod tests {
             (sim.pan_rate - half_max).abs() < 0.01,
             "thermal throttle rate mode: pan_rate={} should be near half_max={}",
             sim.pan_rate, half_max
+        );
+    }
+
+    // ── Laser rangefinder ──────────────────────────────────────────────
+
+    #[test]
+    fn slant_range_nadir_equals_altitude() {
+        // Platform at altitude, looking straight down → slant range ≈ altitude.
+        let mut cfg = Config::default();
+        cfg.stabilization_quality = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pos_lat = 37.0_f64.to_radians();
+        sim.pos_lon = -122.0_f64.to_radians();
+        sim.pos_alt = 1000.0;
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 0.0;
+        sim.target_tilt = std::f32::consts::FRAC_PI_2; // straight down
+
+        // Converge position
+        for _ in 0..200 {
+            sim.tick(0.02);
+        }
+
+        assert!(
+            (sim.slant_range_m - 1000.0).abs() < 50.0,
+            "slant range should be near altitude (1000 m): got {}",
+            sim.slant_range_m
+        );
+    }
+
+    #[test]
+    fn laser_fault_clears_range_source_in_telemetry() {
+        let mut cfg = Config::default();
+        cfg.laser_max_range_m = 50000.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pos_lat = 37.0_f64.to_radians();
+        sim.pos_lon = -122.0_f64.to_radians();
+        sim.pos_alt = 1000.0;
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_tilt = std::f32::consts::FRAC_PI_2;
+
+        for _ in 0..200 {
+            sim.tick(0.02);
+        }
+
+        // Without fault: range_source should be laser.
+        let telem = sim.to_telemetry();
+        assert_eq!(
+            telem.range_source,
+            RangeDataSrc::RangeSrcLaser,
+            "expected laser range source without fault"
+        );
+
+        // With fault: range_source should be None.
+        sim.faults.inject_laser_fault();
+        let telem_fault = sim.to_telemetry();
+        assert_eq!(
+            telem_fault.range_source,
+            RangeDataSrc::RangeSrcNone,
+            "expected no range source with laser fault"
+        );
+    }
+
+    #[test]
+    fn beyond_max_range_no_laser_source() {
+        let mut cfg = Config::default();
+        cfg.laser_max_range_m = 500.0; // very short max range
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pos_lat = 37.0_f64.to_radians();
+        sim.pos_lon = -122.0_f64.to_radians();
+        sim.pos_alt = 5000.0; // 5 km altitude, well beyond 500 m max
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_tilt = std::f32::consts::FRAC_PI_2; // straight down
+
+        for _ in 0..200 {
+            sim.tick(0.02);
+        }
+
+        // Slant range should be computed but exceed max.
+        assert!(
+            sim.slant_range_m > 500.0,
+            "slant range should exceed max: {}",
+            sim.slant_range_m
+        );
+
+        let telem = sim.to_telemetry();
+        assert_eq!(
+            telem.range_source,
+            RangeDataSrc::RangeSrcNone,
+            "expected no laser source when beyond max range"
         );
     }
 }
