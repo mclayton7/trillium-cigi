@@ -104,6 +104,11 @@ pub struct GimbalSimulator {
     /// Instantaneous jitter added to pan for this frame's telemetry.
     pan_jitter: f32,
     tilt_jitter: f32,
+    /// Jitter-perturbed pan/tilt (clean angle + jitter).  Used for
+    /// look-point computation and telemetry so the reported LOS reflects
+    /// the physical vibration of the sensor.
+    pub pan_jittered: f32,
+    pub tilt_jittered: f32,
 
     // ── Diagnostics / faults ────────────────────────────────────────
     pub faults: FaultState,
@@ -165,6 +170,8 @@ impl Default for GimbalSimulator {
             noise_seed: 0xDEAD_BEEF,
             pan_jitter: 0.0,
             tilt_jitter: 0.0,
+            pan_jittered: 0.0,
+            tilt_jittered: 0.0,
             faults: FaultState::default(),
             frame_ctr: 0,
             system_time_ms: 0,
@@ -460,13 +467,17 @@ impl GimbalSimulator {
         let tilt_sin = amp * ((self.jitter_phase + 0.25) * 2.0 * PI).sin();
         self.tilt_jitter = tilt_sin + n2;
 
+        // Store jitter-perturbed angles for look-point and telemetry.
+        self.pan_jittered = self.pan + self.pan_jitter;
+        self.tilt_jittered = self.tilt + self.tilt_jitter;
+
         // ── Geolocation ───────────────────────────────────────────
         if let Some([ll, lo, la]) = geo::compute_look_point(
             self.pos_lat, self.pos_lon, self.pos_alt,
             self.platform_yaw,
             self.platform_roll, self.platform_pitch,
             self.config.stabilization_quality,
-            self.pan, self.tilt,
+            self.pan_jittered, self.tilt_jittered,
         ) {
             self.look_lat = ll;
             self.look_lon = lo;
@@ -574,10 +585,10 @@ impl GimbalSimulator {
         pkt.pos_lon = if self.faults.gps_loss { 0.0 } else { self.pos_lon };
         pkt.pos_alt = if self.faults.gps_loss { 0.0 } else { self.pos_alt };
 
-        // Report pan/tilt with vibration superimposed.
+        // Report jitter-perturbed pan/tilt (pre-computed in tick()).
         // Normalise to (−π, π] so the wire value is always in range.
-        pkt.pan = wrap_angle(self.pan + self.pan_jitter);
-        pkt.tilt = self.tilt + self.tilt_jitter;
+        pkt.pan = wrap_angle(self.pan_jittered);
+        pkt.tilt = self.tilt_jittered;
         pkt.hfov = self.hfov;
         pkt.vfov = self.vfov;
         pkt.mode = self.mode;
@@ -1220,6 +1231,57 @@ mod tests {
             "target_pan={} expected≈{}",
             sim.target_pan,
             expected
+        );
+    }
+
+    #[test]
+    fn jitter_affects_look_point() {
+        // Set up two simulators at altitude with a down-looking tilt so the
+        // LOS hits the ground.  One has high jitter amplitude; the other zero.
+        let mut cfg_jitter = Config::default();
+        cfg_jitter.jitter_amplitude = 0.05; // ~2.9 degrees — very noticeable
+        cfg_jitter.noise_floor = 0.02;
+
+        let mut cfg_clean = Config::default();
+        cfg_clean.jitter_amplitude = 0.0;
+        cfg_clean.noise_floor = 0.0;
+
+        let mut sim_jitter = GimbalSimulator::with_config(cfg_jitter);
+        let mut sim_clean = GimbalSimulator::with_config(cfg_clean);
+
+        // Place both at 1 km altitude, looking straight down.
+        for s in [&mut sim_jitter, &mut sim_clean] {
+            s.pos_lat = 0.5_f64; // ~28.6 deg N
+            s.pos_lon = -1.5_f64;
+            s.pos_alt = 1000.0;
+            s.mode = OrionMode::OrionModePosition;
+            s.target_pan = 0.3;
+            s.target_tilt = 0.8; // ~46 deg down
+        }
+
+        // Run several ticks so the look-point converges.
+        for _ in 0..50 {
+            sim_jitter.tick(0.02);
+            sim_clean.tick(0.02);
+        }
+
+        // The jitter-perturbed simulator should have a different look-point.
+        let dlat = (sim_jitter.look_lat - sim_clean.look_lat).abs();
+        let dlon = (sim_jitter.look_lon - sim_clean.look_lon).abs();
+        assert!(
+            dlat > 1e-9 || dlon > 1e-9,
+            "look-point should differ with jitter: dlat={dlat}, dlon={dlon}"
+        );
+
+        // Also verify the jittered fields are populated.
+        assert!(
+            (sim_jitter.pan_jittered - sim_jitter.pan).abs() > 1e-6,
+            "pan_jittered should differ from clean pan"
+        );
+        // Clean sim should have zero jitter offset.
+        assert!(
+            (sim_clean.pan_jittered - sim_clean.pan).abs() < 1e-9,
+            "zero-jitter sim: pan_jittered should equal pan"
         );
     }
 }
