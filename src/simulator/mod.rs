@@ -123,7 +123,7 @@ pub struct GimbalSimulator {
 impl Default for GimbalSimulator {
     fn default() -> Self {
         let cfg = Config::default();
-        let (hfov, vfov) = cfg.fov_at_zoom(0.0);
+        let (hfov, vfov) = cfg.fov_at_zoom_for_camera(0, 0.0);
         Self {
             pan: 0.0,
             tilt: 0.0,
@@ -178,7 +178,7 @@ impl Default for GimbalSimulator {
 impl GimbalSimulator {
     /// Create a simulator with a specific configuration.
     pub fn with_config(cfg: Config) -> Self {
-        let (hfov, vfov) = cfg.fov_at_zoom(0.0);
+        let (hfov, vfov) = cfg.fov_at_zoom_for_camera(0, 0.0);
         Self {
             hfov,
             vfov,

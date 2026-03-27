@@ -257,21 +257,12 @@ impl Config {
         let def = Config::default();
         let default_cam0 = def.camera_table[0];
         if cfg.camera_table[0] == default_cam0 {
-            let legacy_cam0 = (
+            cfg.camera_table[0] = (
                 cfg.hfov_wide.to_degrees(),
                 cfg.vfov_wide.to_degrees(),
                 cfg.hfov_narrow.to_degrees(),
                 cfg.vfov_narrow.to_degrees(),
             );
-            let def_legacy = (
-                def.hfov_wide.to_degrees(),
-                def.vfov_wide.to_degrees(),
-                def.hfov_narrow.to_degrees(),
-                def.vfov_narrow.to_degrees(),
-            );
-            if legacy_cam0 != def_legacy {
-                cfg.camera_table[0] = legacy_cam0;
-            }
         }
         // Also sync back: hfov_wide/narrow etc. from camera_table[0] so
         // fov_at_zoom() uses the right values for the active camera 0.
