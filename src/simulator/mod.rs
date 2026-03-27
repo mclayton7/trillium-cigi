@@ -417,12 +417,30 @@ impl GimbalSimulator {
                         self.geopoint_lat, self.geopoint_lon, self.geopoint_alt,
                     );
                     self.set_target(tp, tt);
+
+                    // Coordinate pan and tilt axes so they arrive at the
+                    // target simultaneously, producing a straight-line LOS
+                    // trajectory instead of an L-shaped one.
+                    let pan_err = (self.target_pan - self.pan).abs();
+                    let tilt_err = (self.target_tilt - self.tilt).abs();
+
+                    let (pan_rate, tilt_rate) = if pan_err > 0.001 && tilt_err > 0.001 {
+                        let pan_time = pan_err / effective_slew_rate;
+                        let tilt_time = tilt_err / effective_slew_rate;
+                        let max_time = pan_time.max(tilt_time);
+                        let pan_coord_rate = (pan_err / max_time).min(effective_slew_rate);
+                        let tilt_coord_rate = (tilt_err / max_time).min(effective_slew_rate);
+                        (pan_coord_rate, tilt_coord_rate)
+                    } else {
+                        (effective_slew_rate, effective_slew_rate)
+                    };
+
                     tick_axis_trap(
                         &mut self.pan,
                         &mut self.pan_rate,
                         self.target_pan,
                         dt,
-                        effective_slew_rate,
+                        pan_rate,
                         self.config.max_accel,
                     );
                     tick_axis_trap(
@@ -430,7 +448,7 @@ impl GimbalSimulator {
                         &mut self.tilt_rate,
                         self.target_tilt,
                         dt,
-                        effective_slew_rate,
+                        tilt_rate,
                         self.config.max_accel,
                     );
                 }
@@ -1196,6 +1214,55 @@ mod tests {
             (sim.geopoint_alt - 250.0).abs() < 1e-6,
             "geopoint_alt should be set from config: got {}",
             sim.geopoint_alt
+        );
+    }
+
+    #[test]
+    fn geopoint_coordinated_slew_axes_arrive_together() {
+        // Command a geopoint that requires a large pan change but a small
+        // tilt change.  With coordinated slew the tilt axis should slow
+        // down so both axes converge at approximately the same time.
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeGeopoint;
+        sim.pos_lat = 35.0_f64.to_radians();
+        sim.pos_lon = 0.0;
+        sim.pos_alt = 1000.0;
+        // Target slightly south-east: large pan change, small tilt change.
+        sim.geopoint_lat = 34.99_f64.to_radians();
+        sim.geopoint_lon = 0.5_f64.to_radians();
+        sim.geopoint_alt = 0.0;
+
+        // Run until both axes settle (at most 2000 ticks = 40 s at 50 Hz).
+        let mut pan_settled_tick: Option<usize> = None;
+        let mut tilt_settled_tick: Option<usize> = None;
+        let threshold = 0.005_f32; // ~0.3°
+
+        for i in 0..2000 {
+            sim.tick(0.02);
+            let pan_err = (sim.pan - sim.target_pan).abs();
+            let tilt_err = (sim.tilt - sim.target_tilt).abs();
+            if pan_settled_tick.is_none() && pan_err < threshold {
+                pan_settled_tick = Some(i);
+            }
+            if tilt_settled_tick.is_none() && tilt_err < threshold {
+                tilt_settled_tick = Some(i);
+            }
+            if pan_settled_tick.is_some() && tilt_settled_tick.is_some() {
+                break;
+            }
+        }
+
+        let pan_tick = pan_settled_tick.expect("pan should have settled");
+        let tilt_tick = tilt_settled_tick.expect("tilt should have settled");
+
+        // Both axes should arrive within 25 ticks (0.5 s) of each other.
+        // The trapezoidal acceleration/deceleration phases cause some
+        // residual timing difference even with coordinated rates.
+        let diff = (pan_tick as i64 - tilt_tick as i64).unsigned_abs();
+        assert!(
+            diff <= 25,
+            "axes should arrive together: pan settled at tick {}, tilt at tick {} (diff {})",
+            pan_tick, tilt_tick, diff
         );
     }
 
