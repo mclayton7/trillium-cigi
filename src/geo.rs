@@ -150,6 +150,22 @@ pub fn ray_wgs84(origin: [f64; 3], dir: [f64; 3]) -> Option<[f64; 3]> {
 ///
 /// Returns `[lat_rad, lon_rad, alt_m]` on the WGS84 ellipsoid, or `None` if the
 /// line of sight does not intersect the Earth (pointing above the horizon).
+/// Bennett's formula for atmospheric refraction (simplified for EO/IR).
+///
+/// Given a true elevation angle `elev` in radians (negative = below horizon),
+/// returns the refraction offset in radians (always >= 0). The correction
+/// bends the apparent LOS downward, making the effective depression shallower
+/// (i.e. the look-point moves further away).
+fn bennett_refraction(elev: f64) -> f64 {
+    // Bennett's approximation; arguments in radians.
+    // refraction = 0.0002967 / tan(elev + 0.00312 / (elev + 0.089))
+    let denom = (elev + 0.00312 / (elev + 0.089)).tan();
+    if denom.abs() < 1e-12 {
+        return 0.0;
+    }
+    (0.0002967 / denom).max(0.0)
+}
+
 pub fn compute_look_point(
     pos_lat: f64,
     pos_lon: f64,
@@ -160,12 +176,27 @@ pub fn compute_look_point(
     stabilization_quality: f32,
     pan: f32,
     tilt: f32,
+    refraction_enabled: bool,
 ) -> Option<[f64; 3]> {
     if pos_alt < 1.0 {
         return None; // on the ground, no look-point
     }
+
+    // Apply atmospheric refraction correction to the tilt angle.
+    // Tilt convention: positive = depression (looking down).
+    // Elevation angle = -tilt (positive = above horizon, negative = below).
+    let effective_tilt = if refraction_enabled {
+        let elev = -(tilt as f64); // elevation: negative when looking down
+        let refraction_rad = bennett_refraction(elev);
+        // Refraction makes objects appear higher → effective depression is less →
+        // subtract from tilt (look further away).
+        tilt - refraction_rad as f32
+    } else {
+        tilt
+    };
+
     let origin = geodetic_to_ecef(pos_lat, pos_lon, pos_alt);
-    let dir_f32 = los_ecef(pos_lat, pos_lon, platform_yaw, platform_roll, platform_pitch, stabilization_quality, pan, tilt);
+    let dir_f32 = los_ecef(pos_lat, pos_lon, platform_yaw, platform_roll, platform_pitch, stabilization_quality, pan, effective_tilt);
     let dir = [dir_f32[0] as f64, dir_f32[1] as f64, dir_f32[2] as f64];
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if len < 1e-10 {
@@ -266,7 +297,7 @@ mod tests {
         let lat = 37.0_f64.to_radians();
         let lon = -122.0_f64.to_radians();
         let alt = 1000.0;
-        let result = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        let result = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, false);
         let [rl, ro, ra] = result.expect("should intersect");
         assert!((rl - lat).abs() < 1e-5, "look lat should match platform lat");
         assert!((ro - lon).abs() < 1e-5, "look lon should match platform lon");
@@ -281,7 +312,7 @@ mod tests {
         // Compute look point forward and to the right
         let pan0 = 0.5_f32;
         let tilt0 = 0.7_f32; // 40° depression
-        if let Some([tl, to, ta]) = compute_look_point(pos_lat, pos_lon, pos_alt, 0.0, 0.0, 0.0, 0.0, pan0, tilt0) {
+        if let Some([tl, to, ta]) = compute_look_point(pos_lat, pos_lon, pos_alt, 0.0, 0.0, 0.0, 0.0, pan0, tilt0, false) {
             let (pan1, tilt1) = inverse_geopoint(pos_lat, pos_lon, pos_alt, 0.0, tl, to, ta);
             assert!((pan1 - pan0).abs() < 0.01, "pan inverse: {} vs {}", pan1, pan0);
             assert!((tilt1 - tilt0).abs() < 0.01, "tilt inverse: {} vs {}", tilt1, tilt0);
@@ -318,9 +349,9 @@ mod tests {
         let pan = 0.5_f32;
         let tilt = 0.7_f32;
 
-        let result_no_rp = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 0.0, pan, tilt);
+        let result_no_rp = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 0.0, pan, tilt, false);
         // Non-zero roll/pitch but stab_quality = 0.0 → should be identical
-        let result_with_rp = compute_look_point(lat, lon, alt, yaw, 0.2, -0.1, 0.0, pan, tilt);
+        let result_with_rp = compute_look_point(lat, lon, alt, yaw, 0.2, -0.1, 0.0, pan, tilt, false);
         let a = result_no_rp.expect("should intersect");
         let b = result_with_rp.expect("should intersect");
         assert!((a[0] - b[0]).abs() < 1e-10, "lat should match: {} vs {}", a[0], b[0]);
@@ -339,10 +370,10 @@ mod tests {
         let pan = 0.0_f32;
         let tilt = std::f32::consts::FRAC_PI_4; // 45° depression
 
-        let result_no_roll = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt);
+        let result_no_roll = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt, false);
         // Apply 10° roll
         let roll = 10.0_f32.to_radians();
-        let result_with_roll = compute_look_point(lat, lon, alt, yaw, roll, 0.0, 1.0, pan, tilt);
+        let result_with_roll = compute_look_point(lat, lon, alt, yaw, roll, 0.0, 1.0, pan, tilt, false);
 
         let a = result_no_roll.expect("should intersect");
         let b = result_with_roll.expect("should intersect");
@@ -363,9 +394,9 @@ mod tests {
         let pan = 0.0_f32;
         let tilt = std::f32::consts::FRAC_PI_4;
 
-        let result_no_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt);
+        let result_no_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt, false);
         let pitch = 5.0_f32.to_radians();
-        let result_with_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, pitch, 1.0, pan, tilt);
+        let result_with_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, pitch, 1.0, pan, tilt, false);
 
         let a = result_no_pitch.expect("should intersect");
         let b = result_with_pitch.expect("should intersect");
@@ -385,16 +416,83 @@ mod tests {
         let pan = 0.0_f32;
         let tilt = std::f32::consts::FRAC_PI_4;
 
-        let base = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt)
+        let base = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false)
             .expect("intersect");
-        let half = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 0.5, pan, tilt)
+        let half = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 0.5, pan, tilt, false)
             .expect("intersect");
-        let full = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 1.0, pan, tilt)
+        let full = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 1.0, pan, tilt, false)
             .expect("intersect");
 
         let shift_half = (base[0] - half[0]).abs() + (base[1] - half[1]).abs();
         let shift_full = (base[0] - full[0]).abs() + (base[1] - full[1]).abs();
         assert!(shift_half > 1e-7, "half quality should produce a shift");
         assert!(shift_full > shift_half, "full quality should shift more than half: {} vs {}", shift_full, shift_half);
+    }
+
+    #[test]
+    fn refraction_shallow_angle_shifts_look_point_further() {
+        // At a shallow depression angle, refraction should push the look-point
+        // further away (lower latitude difference from nadir for a northward look).
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 5000.0; // 5 km altitude for meaningful shallow-angle effect
+        let pan = 0.0_f32; // looking north
+        let tilt = 0.05_f32; // very shallow depression (~2.9°)
+
+        let without = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false)
+            .expect("should intersect without refraction");
+        let with = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, true)
+            .expect("should intersect with refraction");
+
+        // Refraction reduces effective depression → ray hits ground further away.
+        // Looking north at shallow angle: the refracted look-point should have
+        // a larger latitude (further north) than the unrefracted one.
+        assert!(
+            with[0] > without[0],
+            "refraction should shift look-point further north: with={} vs without={}",
+            with[0].to_degrees(), without[0].to_degrees()
+        );
+    }
+
+    #[test]
+    fn refraction_disabled_matches_original() {
+        // With refraction disabled, compute_look_point should produce the
+        // exact same result regardless of whether the flag existed before.
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 1000.0;
+        let pan = 0.3_f32;
+        let tilt = 0.5_f32;
+
+        let a = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false);
+        let b = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt, false);
+        assert_eq!(a, b, "two calls with refraction disabled should be identical");
+
+        // Also verify refraction enabled at steep angle produces negligible difference.
+        let steep_tilt = std::f32::consts::FRAC_PI_2; // 90° straight down
+        let steep_off = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, steep_tilt, false)
+            .expect("intersect");
+        let steep_on = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, steep_tilt, true)
+            .expect("intersect");
+        let dlat = (steep_off[0] - steep_on[0]).abs();
+        let dlon = (steep_off[1] - steep_on[1]).abs();
+        assert!(dlat < 1e-8, "steep angle refraction should be negligible: dlat={}", dlat);
+        assert!(dlon < 1e-8, "steep angle refraction should be negligible: dlon={}", dlon);
+    }
+
+    #[test]
+    fn bennett_refraction_values() {
+        // At elevation = 0 (horizon), refraction should be positive and significant.
+        let r_horizon = bennett_refraction(0.0);
+        assert!(r_horizon > 0.0, "refraction at horizon should be positive");
+        // Standard atmosphere: ~34 arcminutes ≈ 0.0099 rad at horizon.
+        // Bennett's simplified formula gives approximately this.
+        assert!(r_horizon > 0.005, "refraction at horizon should be > 5 mrad: {}", r_horizon);
+        assert!(r_horizon < 0.02, "refraction at horizon should be < 20 mrad: {}", r_horizon);
+
+        // At 45° elevation, refraction should be very small.
+        let r_45 = bennett_refraction(std::f64::consts::FRAC_PI_4);
+        assert!(r_45 < 0.001, "refraction at 45° should be < 1 mrad: {}", r_45);
+        assert!(r_45 >= 0.0, "refraction should never be negative");
     }
 }

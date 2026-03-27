@@ -72,6 +72,10 @@ pub struct Config {
     /// roll/pitch coupling).  Default: 0.0 (Orion is inertially stabilized).
     pub stabilization_quality: f32,
 
+    // ── Atmospheric ──────────────────────────────────────────
+    /// Enable atmospheric refraction correction for LOS ray-cast. Default: true.
+    pub refraction_enabled: bool,
+
     // ── Geopoint ──────────────────────────────────────────
     /// Default target altitude (metres) for geopoint mode. Default: 0.0.
     pub geopoint_alt_m: f64,
@@ -130,6 +134,7 @@ impl Default for Config {
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
+            refraction_enabled: true,
             geopoint_alt_m: 0.0,
             track_p_gain: 3.0,
             track_d_gain: 0.5,
@@ -198,6 +203,13 @@ impl Config {
                 }
                 "stabilization_quality" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.stabilization_quality = v.clamp(0.0, 1.0); }
+                }
+                "refraction_enabled" => {
+                    match val {
+                        "true" | "1" => cfg.refraction_enabled = true,
+                        "false" | "0" => cfg.refraction_enabled = false,
+                        _ => {}
+                    }
                 }
                 "geopoint_alt_m" => {
                     if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }

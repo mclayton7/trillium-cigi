@@ -478,6 +478,7 @@ impl GimbalSimulator {
             self.platform_roll, self.platform_pitch,
             self.config.stabilization_quality,
             self.pan_jittered, self.tilt_jittered,
+            self.config.refraction_enabled,
         ) {
             self.look_lat = ll;
             self.look_lon = lo;
