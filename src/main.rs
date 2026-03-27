@@ -68,10 +68,12 @@ async fn main() {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(DT));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let startup_time = Instant::now();
     let mut frame_ctr: u32 = 0;
     let mut noise_seed: u32 = 0xCAFE_BABE;
     let mut last_cmd: Option<OrionCmdPacket> = None;
     let mut last_sof: Option<Instant> = None;
+    let mut last_ig_frame_ctr: u32 = 0;
 
     println!(
         "CIGI Trillium Bridge — Trillium TCP :{} | CIGI UDP :{} → {}:{}",
@@ -98,7 +100,7 @@ async fn main() {
                 if sg_connected {
                     // ── Scene generator path ─────────────────────────────
                     let platform = platform_rx.borrow().clone();
-                    let ig = make_ig_control(frame_ctr);
+                    let ig = make_ig_control(frame_ctr, last_ig_frame_ctr, startup_time.elapsed().as_secs_f32());
                     let ec = platform_to_entity_control(&platform, PLATFORM_ENTITY_ID);
                     let sc = last_cmd.as_ref().map(|cmd| {
                         orion_cmd_to_sensor_control(cmd, sim.camera_index, sim.zoom_level)
@@ -136,8 +138,9 @@ async fn main() {
             // ── CIGI response from scene generator ───────────────────────
             Some(resp) = cigi_resp_rx.recv() => {
                 match resp {
-                    CigiResponse::StartOfFrame(_sof) => {
+                    CigiResponse::StartOfFrame(sof) => {
                         last_sof = Some(Instant::now());
+                        last_ig_frame_ctr = sof.ig_frame_ctr;
                     }
                     CigiResponse::SensorResponse(ser) => {
                         let platform = platform_rx.borrow().clone();

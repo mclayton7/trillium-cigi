@@ -41,16 +41,20 @@ fn orion_mode_to_sensor_status(mode: OrionMode) -> u8 {
 }
 
 /// Build an `IgControl` packet for the given host frame counter.
-pub fn make_ig_control(host_frame: u32) -> IgControl {
+///
+/// `last_ig_frame` is the most recent `ig_frame_ctr` received from the IG via
+/// `StartOfFrame`. `timestamp` is the host elapsed time in seconds (used by the
+/// IG for dead-reckoning).
+pub fn make_ig_control(host_frame: u32, last_ig_frame: u32, timestamp: f32) -> IgControl {
     IgControl {
         ig_mode: 0, // Normal operation
         frame_ctr: host_frame,
-        last_rcvd_ig_frame_ctr: 0,
-        timestamp_valid: false,
+        last_rcvd_ig_frame_ctr: last_ig_frame as u16,
+        timestamp_valid: true,
         extrapolation_enable: false,
         minor_version: 3,
         db_number: 1,
-        timestamp: 0.0,
+        timestamp: timestamp as f64,
     }
 }
 
@@ -221,12 +225,21 @@ mod tests {
 
     #[test]
     fn ig_control_fields() {
-        let ig = make_ig_control(42);
+        let ig = make_ig_control(42, 0, 0.0);
         assert_eq!(ig.ig_mode, 0);
         assert_eq!(ig.frame_ctr, 42);
         assert_eq!(ig.minor_version, 3);
         assert_eq!(ig.db_number, 1);
-        assert!(!ig.timestamp_valid);
+        assert!(ig.timestamp_valid);
+    }
+
+    #[test]
+    fn ig_control_timestamp_and_frame_counter() {
+        let ig = make_ig_control(100, 97, 3.5);
+        assert_eq!(ig.frame_ctr, 100);
+        assert_eq!(ig.last_rcvd_ig_frame_ctr, 97);
+        assert!(ig.timestamp_valid);
+        assert!((ig.timestamp - 3.5).abs() < 1e-5, "timestamp={}", ig.timestamp);
     }
 
     // ── platform_to_entity_control ───────────────────────────────────────────
