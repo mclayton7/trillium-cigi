@@ -494,6 +494,14 @@ impl GimbalSimulator {
             self.tilt_rate = 0.0;
         }
 
+        // ── Cross-axis gyroscopic coupling ──────────────────────────
+        if self.config.gyro_coupling_factor != 0.0 {
+            let pan_coupling = self.config.gyro_coupling_factor * self.tilt_rate * self.pan_rate * dt_secs as f32;
+            let tilt_coupling = self.config.gyro_coupling_factor * self.pan_rate * self.tilt_rate * dt_secs as f32;
+            self.pan += pan_coupling;
+            self.tilt += tilt_coupling;
+        }
+
         // ── Settled detection ──────────────────────────────────────
         self.settled = match self.mode {
             OrionMode::OrionModePosition
@@ -1850,5 +1858,113 @@ mod tests {
 
         assert!(!sim.track_active,
             "track should be lost when confidence < 0.3 at extreme range");
+    }
+
+    // ── Gyroscopic coupling tests ──────────────────────────────────
+
+    #[test]
+    fn gyro_coupling_zero_factor_no_effect() {
+        // With gyro_coupling_factor = 0.0, pan and tilt are independent.
+        let mut cfg = crate::config::Config::default();
+        cfg.gyro_coupling_factor = 0.0;
+        cfg.jitter_amplitude = 0.0;
+        cfg.noise_floor = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.mode = OrionMode::OrionModeRate;
+        sim.pan_rate_cmd = 0.5;
+        sim.tilt_rate_cmd = 0.3;
+
+        // Run several ticks to build up rates.
+        for _ in 0..10 {
+            sim.tick(0.02);
+        }
+        let pan_no_coupling = sim.pan;
+        let tilt_no_coupling = sim.tilt;
+
+        // Run the same scenario with coupling factor 0.0 from scratch — identical result.
+        let mut cfg2 = crate::config::Config::default();
+        cfg2.gyro_coupling_factor = 0.0;
+        cfg2.jitter_amplitude = 0.0;
+        cfg2.noise_floor = 0.0;
+        let mut sim2 = GimbalSimulator::with_config(cfg2);
+        sim2.mode = OrionMode::OrionModeRate;
+        sim2.pan_rate_cmd = 0.5;
+        sim2.tilt_rate_cmd = 0.3;
+        for _ in 0..10 {
+            sim2.tick(0.02);
+        }
+
+        assert!((sim2.pan - pan_no_coupling).abs() < 1e-8,
+            "zero coupling factor should produce identical pan");
+        assert!((sim2.tilt - tilt_no_coupling).abs() < 1e-8,
+            "zero coupling factor should produce identical tilt");
+    }
+
+    #[test]
+    fn gyro_coupling_nonzero_produces_offset() {
+        // With gyro_coupling_factor = 0.1 and both axes slewing,
+        // cross-axis coupling produces a measurable angular offset.
+        let mut cfg_base = crate::config::Config::default();
+        cfg_base.jitter_amplitude = 0.0;
+        cfg_base.noise_floor = 0.0;
+        cfg_base.gyro_coupling_factor = 0.0;
+        let mut sim_base = GimbalSimulator::with_config(cfg_base);
+        sim_base.mode = OrionMode::OrionModeRate;
+        sim_base.pan_rate_cmd = 0.5;
+        sim_base.tilt_rate_cmd = 0.3;
+        for _ in 0..50 {
+            sim_base.tick(0.02);
+        }
+
+        let mut cfg_coupled = crate::config::Config::default();
+        cfg_coupled.jitter_amplitude = 0.0;
+        cfg_coupled.noise_floor = 0.0;
+        cfg_coupled.gyro_coupling_factor = 0.1;
+        let mut sim_coupled = GimbalSimulator::with_config(cfg_coupled);
+        sim_coupled.mode = OrionMode::OrionModeRate;
+        sim_coupled.pan_rate_cmd = 0.5;
+        sim_coupled.tilt_rate_cmd = 0.3;
+        for _ in 0..50 {
+            sim_coupled.tick(0.02);
+        }
+
+        let pan_diff = (sim_coupled.pan - sim_base.pan).abs();
+        let tilt_diff = (sim_coupled.tilt - sim_base.tilt).abs();
+        assert!(pan_diff > 1e-6,
+            "coupling should produce measurable pan offset, got diff={}", pan_diff);
+        assert!(tilt_diff > 1e-6,
+            "coupling should produce measurable tilt offset, got diff={}", tilt_diff);
+    }
+
+    #[test]
+    fn gyro_coupling_zero_rate_one_axis_no_coupling() {
+        // If one axis rate is zero, coupling produces no effect (product is zero).
+        let mut cfg = crate::config::Config::default();
+        cfg.gyro_coupling_factor = 0.5;
+        cfg.jitter_amplitude = 0.0;
+        cfg.noise_floor = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg.clone());
+        sim.mode = OrionMode::OrionModeRate;
+        sim.pan_rate_cmd = 0.5;
+        sim.tilt_rate_cmd = 0.0; // tilt rate stays zero
+
+        let mut sim_no_coupling = GimbalSimulator::with_config({
+            let mut c = cfg.clone();
+            c.gyro_coupling_factor = 0.0;
+            c
+        });
+        sim_no_coupling.mode = OrionMode::OrionModeRate;
+        sim_no_coupling.pan_rate_cmd = 0.5;
+        sim_no_coupling.tilt_rate_cmd = 0.0;
+
+        for _ in 0..50 {
+            sim.tick(0.02);
+            sim_no_coupling.tick(0.02);
+        }
+
+        assert!((sim.pan - sim_no_coupling.pan).abs() < 1e-8,
+            "with one rate zero, coupling should have no effect on pan");
+        assert!((sim.tilt - sim_no_coupling.tilt).abs() < 1e-8,
+            "with one rate zero, coupling should have no effect on tilt");
     }
 }

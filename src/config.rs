@@ -72,6 +72,12 @@ pub struct Config {
     /// roll/pitch coupling).  Default: 0.0 (Orion is inertially stabilized).
     pub stabilization_quality: f32,
 
+    // ── Gyroscopic coupling ─────────────────────────────────
+    /// First-order cross-axis gyroscopic coupling factor.
+    /// 0.0 = disabled (axes fully independent), >0 = coupling proportional
+    /// to the product of both axis rates.  Default: 0.0.
+    pub gyro_coupling_factor: f32,
+
     // ── Atmospheric ──────────────────────────────────────────
     /// Enable atmospheric refraction correction for LOS ray-cast. Default: true.
     pub refraction_enabled: bool,
@@ -147,6 +153,7 @@ impl Default for Config {
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
+            gyro_coupling_factor: 0.0,
             refraction_enabled: true,
             terrain_elevation_m: 0.0,
             laser_max_range_m: 20000.0,
@@ -220,6 +227,9 @@ impl Config {
                 }
                 "stabilization_quality" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.stabilization_quality = v.clamp(0.0, 1.0); }
+                }
+                "gyro_coupling_factor" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.gyro_coupling_factor = v; }
                 }
                 "refraction_enabled" => {
                     match val {
