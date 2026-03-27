@@ -64,11 +64,11 @@ pub fn ned_frame(lat: f64, lon: f64) -> ([f64; 3], [f64; 3], [f64; 3]) {
 
 /// Compute the gimbal line-of-sight as an ECEF unit vector.
 ///
-/// `pan` is the azimuth in the NED frame (0 = north, + clockwise), radians.
+/// `pan` is the azimuth in the gimbal body frame (0 = nose, + clockwise), radians.
 /// `tilt` is the depression angle (0 = horizontal, + downward), radians.
-/// Platform attitude (roll/pitch/yaw) is included for the inertial→NED mapping.
-/// For a fully stabilised gimbal the pan/tilt are already inertial, so we add
-/// platform yaw only to convert from "nose-relative" to NED azimuth.
+/// Platform attitude (roll/pitch/yaw) rotates the gimbal-frame direction into NED.
+/// For a fully stabilised gimbal (`stabilization_quality = 0`) only yaw is applied;
+/// at `stabilization_quality = 1` the full ZYX rotation (yaw, pitch, roll) applies.
 ///
 /// `platform_roll` and `platform_pitch` are applied scaled by
 /// `stabilization_quality` (0.0 = perfect stabilization, 1.0 = body-mounted).
@@ -179,6 +179,11 @@ pub fn compute_look_point(
 /// `(target_lat, target_lon, target_alt)` from the platform position.
 ///
 /// Returns `(pan_rad, tilt_rad)` in the platform-yaw-relative frame.
+// NOTE: This function does not account for platform roll/pitch when
+// stabilization_quality > 0. The forward LOS path (los_ecef) applies
+// full ZYX rotation, but this inverse only subtracts yaw. Geopoint
+// mode will have residual pointing error proportional to
+// roll/pitch * stabilization_quality.
 pub fn inverse_geopoint(
     pos_lat: f64,
     pos_lon: f64,
