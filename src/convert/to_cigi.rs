@@ -82,7 +82,11 @@ pub fn platform_to_entity_control(platform: &PlatformState, entity_id: u16) -> E
 ///
 /// Pan/tilt target mapping (Position mode):  target[0..1] (rad) → gain/level via ±π scale.
 /// Pan/tilt rate mapping (Rate mode):        target[0..1] (rad/s) → gain/level via ±MAX_RATE scale.
-pub fn orion_cmd_to_sensor_control(cmd: &OrionCmdPacket) -> SensorControl {
+pub fn orion_cmd_to_sensor_control(
+    cmd: &OrionCmdPacket,
+    camera_index: i8,
+    zoom_level: f32,
+) -> SensorControl {
     use std::f32::consts::PI;
     let max_rate = crate::convert::MAX_SLEW_RATE;
 
@@ -111,13 +115,21 @@ pub fn orion_cmd_to_sensor_control(cmd: &OrionCmdPacket) -> SensorControl {
         }
     };
 
+    // In Geopoint mode ac_coupling carries the lat encoding, so leave it at default.
+    // In Position/Rate modes, forward the zoom level.
+    let ac_coupling = match cmd.cmd.mode {
+        OrionMode::OrionModeGeopoint => 0.0,
+        _ => zoom_level.clamp(0.0, 1.0),
+    };
+
     SensorControl {
-        sensor_id: 0, // camera 0 by default; override from cmd if available
+        sensor_id: (camera_index.clamp(0, 2)) as u8,
         view_id: 0,
         sensor_state,
         track_mode,
         gain,
         level,
+        ac_coupling,
         ..SensorControl::default()
     }
 }
@@ -261,19 +273,19 @@ mod tests {
 
     #[test]
     fn sc_disabled_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeDisabled, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeDisabled, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 0);
     }
 
     #[test]
     fn sc_fault_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeFault, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeFault, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 0);
     }
 
     #[test]
     fn sc_position_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32 / 2.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32 / 2.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 1);
         assert_eq!(sc.track_mode, 0);
         assert!((sc.gain - 0.75).abs() < 1e-5, "gain={}", sc.gain);
@@ -282,15 +294,15 @@ mod tests {
 
     #[test]
     fn sc_position_centre_is_half() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), 0, 0.0);
         assert!((sc.gain - 0.5).abs() < 1e-5);
         assert!((sc.level - 0.5).abs() < 1e-5);
     }
 
     #[test]
     fn sc_position_full_range() {
-        let sc_max = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32, 0.0]));
-        let sc_min = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [-PI32, 0.0]));
+        let sc_max = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32, 0.0]), 0, 0.0);
+        let sc_min = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [-PI32, 0.0]), 0, 0.0);
         assert!((sc_max.gain - 1.0).abs() < 1e-5);
         assert!((sc_min.gain - 0.0).abs() < 1e-5);
     }
@@ -298,9 +310,9 @@ mod tests {
     #[test]
     fn sc_rate_mode() {
         let max = crate::convert::MAX_SLEW_RATE;
-        let sc_pos = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [max, 0.0]));
-        let sc_neg = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [-max, 0.0]));
-        let sc_zero = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [0.0, 0.0]));
+        let sc_pos = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [max, 0.0]), 0, 0.0);
+        let sc_neg = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [-max, 0.0]), 0, 0.0);
+        let sc_zero = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc_pos.sensor_state, 1);
         assert_eq!(sc_pos.track_mode, 0x01);
         assert!((sc_pos.gain - 1.0).abs() < 1e-5);
@@ -310,13 +322,53 @@ mod tests {
 
     #[test]
     fn sc_track_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeTrack, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeTrack, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 2);
     }
 
     #[test]
     fn sc_geopoint_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeGeopoint, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeGeopoint, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 4);
+    }
+
+    // ── camera_index and zoom_level forwarding ─────────────────────────────
+
+    #[test]
+    fn sc_camera_index_forwarded() {
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), 2, 0.0);
+        assert_eq!(sc.sensor_id, 2);
+    }
+
+    #[test]
+    fn sc_camera_index_clamped() {
+        let sc_neg = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), -1, 0.0);
+        let sc_high = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), 5, 0.0);
+        assert_eq!(sc_neg.sensor_id, 0);
+        assert_eq!(sc_high.sensor_id, 2);
+    }
+
+    #[test]
+    fn sc_zoom_forwarded_in_position_mode() {
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), 0, 0.75);
+        assert!((sc.ac_coupling - 0.75).abs() < 1e-5, "ac_coupling={}", sc.ac_coupling);
+    }
+
+    #[test]
+    fn sc_zoom_forwarded_in_rate_mode() {
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [0.0, 0.0]), 0, 0.5);
+        assert!((sc.ac_coupling - 0.5).abs() < 1e-5, "ac_coupling={}", sc.ac_coupling);
+    }
+
+    #[test]
+    fn sc_zoom_not_forwarded_in_geopoint_mode() {
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeGeopoint, [0.0, 0.0]), 0, 0.8);
+        assert!((sc.ac_coupling - 0.0).abs() < 1e-5, "ac_coupling should be 0 in geopoint mode, got {}", sc.ac_coupling);
+    }
+
+    #[test]
+    fn sc_zoom_clamped() {
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), 0, 1.5);
+        assert!((sc.ac_coupling - 1.0).abs() < 1e-5, "ac_coupling={}", sc.ac_coupling);
     }
 }

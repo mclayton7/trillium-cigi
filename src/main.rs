@@ -100,13 +100,15 @@ async fn main() {
                     let platform = platform_rx.borrow().clone();
                     let ig = make_ig_control(frame_ctr);
                     let ec = platform_to_entity_control(&platform, PLATFORM_ENTITY_ID);
-                    let sc = last_cmd.as_ref().map(orion_cmd_to_sensor_control);
+                    let sc = last_cmd.as_ref().map(|cmd| {
+                        orion_cmd_to_sensor_control(cmd, sim.camera_index, sim.zoom_level)
+                    });
                     let datagram = build_datagram(&ig, &ec, sc.as_ref());
                     cigi_send_tx.try_send(datagram).ok();
                 } else {
                     // ── Simulator fallback ───────────────────────────────
                     if let Some(ref cmd) = last_cmd {
-                        let sc = orion_cmd_to_sensor_control(cmd);
+                        let sc = orion_cmd_to_sensor_control(cmd, sim.camera_index, sim.zoom_level);
                         sim.apply_sensor_control(&sc);
                     }
                     sim.tick(DT);
