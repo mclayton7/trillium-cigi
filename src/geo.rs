@@ -251,4 +251,23 @@ mod tests {
             assert!((tilt1 - tilt0).abs() < 0.01, "tilt inverse: {} vs {}", tilt1, tilt0);
         }
     }
+
+    #[test]
+    fn inverse_geopoint_nonzero_altitude() {
+        let pos_lat = 37.0_f64.to_radians();
+        let pos_lon = -122.0_f64.to_radians();
+        let pos_alt = 2000.0;
+        let target_lat = 37.001_f64.to_radians();
+        let target_lon = -121.999_f64.to_radians();
+
+        // At sea level
+        let (pan0, tilt0) = inverse_geopoint(pos_lat, pos_lon, pos_alt, 0.0, target_lat, target_lon, 0.0);
+        // At 500 m altitude
+        let (pan500, tilt500) = inverse_geopoint(pos_lat, pos_lon, pos_alt, 0.0, target_lat, target_lon, 500.0);
+
+        // Pan should be nearly identical (same horizontal direction).
+        assert!((pan0 - pan500).abs() < 0.01, "pan should be similar: {} vs {}", pan0, pan500);
+        // Higher target → less depression (smaller tilt).
+        assert!(tilt500 < tilt0, "higher target alt should reduce tilt: {} vs {}", tilt500, tilt0);
+    }
 }

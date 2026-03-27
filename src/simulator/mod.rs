@@ -231,7 +231,7 @@ impl GimbalSimulator {
                 // ac_coupling/noise encode full-Earth lat/lon as 0–1 fractions.
                 self.geopoint_lat = (sc.ac_coupling as f64 * 180.0 - 90.0).to_radians();
                 self.geopoint_lon = (sc.noise as f64 * 360.0 - 180.0).to_radians();
-                self.geopoint_alt = 0.0;
+                self.geopoint_alt = self.config.geopoint_alt_m;
             }
             _ => {
                 // Position mode: gain/level → pan/tilt targets in ±π, then clamped.
@@ -921,6 +921,76 @@ mod tests {
 
         // Tilt should be positive (depression, + down convention) to reach a ground target.
         assert!(sim.tilt > 0.0, "tilt should be positive (down), got {}", sim.tilt);
+    }
+
+    #[test]
+    fn geopoint_nonzero_altitude_changes_tilt() {
+        // With a higher target altitude, the required tilt (depression) should be less
+        // because the target is closer in elevation to the platform.
+        let mut sim_low = GimbalSimulator::default();
+        sim_low.mode = OrionMode::OrionModeGeopoint;
+        sim_low.pos_lat = 35.0_f64.to_radians();
+        sim_low.pos_lon = 0.0;
+        sim_low.pos_alt = 1000.0;
+        sim_low.geopoint_lat = 30.0_f64.to_radians();
+        sim_low.geopoint_lon = 0.0;
+        sim_low.geopoint_alt = 0.0;
+
+        let mut sim_high = GimbalSimulator::default();
+        sim_high.mode = OrionMode::OrionModeGeopoint;
+        sim_high.pos_lat = 35.0_f64.to_radians();
+        sim_high.pos_lon = 0.0;
+        sim_high.pos_alt = 1000.0;
+        sim_high.geopoint_lat = 30.0_f64.to_radians();
+        sim_high.geopoint_lon = 0.0;
+        sim_high.geopoint_alt = 500.0; // target at 500m elevation
+
+        // Run enough ticks for the targets to converge.
+        for _ in 0..100 {
+            sim_low.tick(0.02);
+            sim_high.tick(0.02);
+        }
+
+        // Higher target altitude → less tilt depression (smaller tilt value).
+        assert!(
+            sim_high.tilt < sim_low.tilt,
+            "higher target alt should require less tilt depression: high={} vs low={}",
+            sim_high.tilt, sim_low.tilt
+        );
+    }
+
+    #[test]
+    fn geopoint_config_alt_used_as_default() {
+        // Verify that Config::geopoint_alt_m is applied when entering geopoint mode.
+        let mut cfg = Config::default();
+        cfg.geopoint_alt_m = 250.0;
+        cfg.platform_lat = 35.0_f64.to_radians();
+        cfg.platform_lon = 0.0;
+        cfg.platform_alt = 1000.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.mode = OrionMode::OrionModeGeopoint;
+        // Simulate receiving a SensorControl that sets geopoint mode.
+        let sc = crate::cigi::messages::SensorControl {
+            view_id: 0,
+            sensor_id: 0,
+            sensor_state: 4, // Geopoint mode
+            polarity: false,
+            line_of_sight_enable: false,
+            track_mode: 0,
+            response_type: false,
+            auto_gain: false,
+            track_polarity: false,
+            gain: 0.0,
+            level: 0.0,
+            ac_coupling: 0.5,  // lat fraction → 0° lat
+            noise: 0.5,       // lon fraction → 0° lon
+        };
+        sim.apply_sensor_control(&sc);
+        assert!(
+            (sim.geopoint_alt - 250.0).abs() < 1e-6,
+            "geopoint_alt should be set from config: got {}",
+            sim.geopoint_alt
+        );
     }
 
     // ── Track mode ────────────────────────────────────────────────────────

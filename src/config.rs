@@ -66,6 +66,10 @@ pub struct Config {
     /// White-noise floor (rad RMS). Default: ~0.01° ≈ 0.175 mrad.
     pub noise_floor: f32,
 
+    // ── Geopoint ──────────────────────────────────────────
+    /// Default target altitude (metres) for geopoint mode. Default: 0.0.
+    pub geopoint_alt_m: f64,
+
     // ── Platform source ───────────────────────────────
     /// Platform data source: "static" (default), "mavlink", or "stanag4586".
     pub platform_source: String,
@@ -111,6 +115,7 @@ impl Default for Config {
             jitter_freq: 10.0,
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
+            geopoint_alt_m: 0.0,
             platform_source: "static".to_string(),
             mavlink_listen_port: 14550,
             mavlink_system_id: 0,
@@ -172,6 +177,9 @@ impl Config {
                 }
                 "noise_floor_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.noise_floor = v.to_radians(); }
+                }
+                "geopoint_alt_m" => {
+                    if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }
                 }
                 "orion_listen_port" => {
                     if let Ok(v) = val.parse::<u16>() { cfg.orion_listen_port = v; }
