@@ -63,6 +63,10 @@ pub struct Config {
     pub jitter_freq: f32,
     /// Peak jitter amplitude (rad). Default: ~0.05° ≈ 0.87 mrad.
     pub jitter_amplitude: f32,
+    /// Second structural resonance frequency (Hz). Default: 47 Hz.
+    pub jitter_freq_2: f32,
+    /// Second resonance peak amplitude (rad). Default: ~0.01° ≈ 0.175 mrad.
+    pub jitter_amplitude_2: f32,
     /// White-noise floor (rad RMS). Default: ~0.01° ≈ 0.175 mrad.
     pub noise_floor: f32,
 
@@ -151,6 +155,8 @@ impl Default for Config {
             ],
             jitter_freq: 10.0,
             jitter_amplitude: 0.05_f32.to_radians(),
+            jitter_freq_2: 47.0,
+            jitter_amplitude_2: 0.01_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
             gyro_coupling_factor: 0.0,
@@ -221,6 +227,12 @@ impl Config {
                 }
                 "jitter_amplitude_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.jitter_amplitude = v.to_radians(); }
+                }
+                "jitter_freq_2_hz" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.jitter_freq_2 = v; }
+                }
+                "jitter_amplitude_2_deg" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.jitter_amplitude_2 = v.to_radians(); }
                 }
                 "noise_floor_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.noise_floor = v.to_radians(); }

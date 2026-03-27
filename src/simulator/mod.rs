@@ -105,8 +105,9 @@ pub struct GimbalSimulator {
     prev_track_y: f32,
 
     // ── Vibration ────────────────────────────────────────────────────
-    jitter_phase: f32, // accumulated cycles
-    noise_seed: u32,   // LCG state
+    jitter_phase: f32,   // accumulated cycles (primary frequency)
+    jitter_phase_2: f32, // accumulated cycles (second structural resonance)
+    noise_seed: u32,     // LCG state
     /// Instantaneous jitter added to pan for this frame's telemetry.
     pan_jitter: f32,
     tilt_jitter: f32,
@@ -180,6 +181,7 @@ impl Default for GimbalSimulator {
             prev_track_y: 0.0,
             settled: false,
             jitter_phase: 0.0,
+            jitter_phase_2: 0.0,
             noise_seed: 0xDEAD_BEEF,
             pan_jitter: 0.0,
             tilt_jitter: 0.0,
@@ -539,10 +541,17 @@ impl GimbalSimulator {
         let sinusoidal = amp * (self.jitter_phase * 2.0 * PI).sin();
         let n1 = lcg_noise_f32(&mut self.noise_seed) * self.config.noise_floor;
         let n2 = lcg_noise_f32(&mut self.noise_seed) * self.config.noise_floor;
-        self.pan_jitter = sinusoidal + n1;
+        // Second structural resonance (fixed amplitude, not slew-dependent).
+        self.jitter_phase_2 =
+            (self.jitter_phase_2 + self.config.jitter_freq_2 * dt) % 1.0;
+        let amp2 = self.config.jitter_amplitude_2; // already in radians
+        let sin2_pan = amp2 * (self.jitter_phase_2 * 2.0 * PI).sin();
+        let sin2_tilt = amp2 * ((self.jitter_phase_2 + 0.25) * 2.0 * PI).sin();
+
+        self.pan_jitter = sinusoidal + sin2_pan + n1;
         // Tilt jitter is correlated but at a 90° phase offset for realism.
         let tilt_sin = amp * ((self.jitter_phase + 0.25) * 2.0 * PI).sin();
-        self.tilt_jitter = tilt_sin + n2;
+        self.tilt_jitter = tilt_sin + sin2_tilt + n2;
 
         // Store jitter-perturbed angles for look-point and telemetry.
         self.pan_jittered = self.pan + self.pan_jitter;
@@ -1417,6 +1426,62 @@ mod tests {
         assert!(
             fast_jitter >= still_jitter,
             "fast jitter ({fast_jitter}) should be >= still jitter ({still_jitter})"
+        );
+    }
+
+    #[test]
+    fn multi_frequency_jitter_differs_from_single() {
+        // With jitter_amplitude_2 > 0, the jitter pattern differs from single-frequency.
+        let mut cfg_single = Config::default();
+        cfg_single.jitter_amplitude_2 = 0.0;
+        cfg_single.noise_floor = 0.0; // remove noise to isolate sinusoidal
+
+        let mut cfg_multi = Config::default();
+        // Keep default jitter_amplitude_2 (~0.01 deg in radians)
+        cfg_multi.noise_floor = 0.0;
+
+        let mut sim_single = GimbalSimulator::with_config(cfg_single);
+        let mut sim_multi = GimbalSimulator::with_config(cfg_multi);
+
+        // Tick several frames and compare jitter values.
+        let mut any_differ = false;
+        for _ in 0..50 {
+            sim_single.tick(0.02);
+            sim_multi.tick(0.02);
+            if (sim_single.pan_jitter - sim_multi.pan_jitter).abs() > 1e-9 {
+                any_differ = true;
+                break;
+            }
+        }
+        assert!(any_differ, "multi-frequency jitter should differ from single-frequency");
+    }
+
+    #[test]
+    fn second_frequency_nonzero_at_primary_zero_crossing() {
+        // Choose a time where freq_1 (10 Hz) is at a zero crossing but
+        // freq_2 (47 Hz) is NOT, proving both contribute independently.
+        let mut cfg = Config::default();
+        cfg.noise_floor = 0.0; // remove noise
+        cfg.jitter_amplitude = 0.05_f32.to_radians();
+        cfg.jitter_amplitude_2 = 0.01_f32.to_radians();
+        cfg.jitter_freq = 10.0;
+        cfg.jitter_freq_2 = 47.0;
+
+        let mut sim = GimbalSimulator::with_config(cfg);
+
+        // Primary freq = 10 Hz → period = 0.1 s → zero crossing at phase 0.5
+        // (half cycle). Advance exactly 50 ms = half period of 10 Hz.
+        // At dt=0.001 that is 50 ticks.
+        for _ in 0..50 {
+            sim.tick(0.001);
+        }
+        // At this point jitter_phase should be ~0.5, so sin(PI) ≈ 0 for primary.
+        // But jitter_phase_2 = 47 * 0.05 = 2.35, frac = 0.35 → sin(0.35*2*PI) != 0.
+        // So pan_jitter should be nonzero (from freq_2 alone).
+        assert!(
+            sim.pan_jitter.abs() > 1e-6,
+            "jitter should be nonzero at primary zero crossing due to second frequency, got {}",
+            sim.pan_jitter
         );
     }
 
