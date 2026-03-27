@@ -164,6 +164,9 @@ impl FaultState {
             });
         }
         if self.gps_loss {
+            // NOTE: The Orion protocol XML defines no GPS-specific fault type.
+            // FaultTypeNone + FaultLevelWarning is a convention for GPS loss.
+            // Update if a GPS fault type is added to OrionPublicProtocol.xml.
             pkts.push(OrionFaultPacket {
                 type_: OrionFaultType::FaultTypeNone,
                 level: OrionFaultLevel::FaultLevelWarning,
