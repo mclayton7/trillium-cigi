@@ -69,20 +69,48 @@ pub fn ned_frame(lat: f64, lon: f64) -> ([f64; 3], [f64; 3], [f64; 3]) {
 /// Platform attitude (roll/pitch/yaw) is included for the inertial→NED mapping.
 /// For a fully stabilised gimbal the pan/tilt are already inertial, so we add
 /// platform yaw only to convert from "nose-relative" to NED azimuth.
+///
+/// `platform_roll` and `platform_pitch` are applied scaled by
+/// `stabilization_quality` (0.0 = perfect stabilization, 1.0 = body-mounted).
+/// The rotation order is Rz(yaw) · Ry(pitch·sq) · Rx(roll·sq) applied to the
+/// gimbal-frame LOS direction.
 pub fn los_ecef(
     lat: f64,
     lon: f64,
     platform_yaw: f32,
+    platform_roll: f32,
+    platform_pitch: f32,
+    stabilization_quality: f32,
     pan: f32,
     tilt: f32,
 ) -> [f32; 3] {
-    // Inertial NED azimuth = gimbal pan + platform yaw heading
-    let az = (pan + platform_yaw) as f64;
+    // Gimbal-frame LOS: pan is azimuth from nose, tilt is depression.
+    let az = pan as f64;
     let el = tilt as f64; // positive = depression (downward)
 
-    let n = el.cos() * az.cos();
-    let e = el.cos() * az.sin();
-    let d = el.sin(); // positive down
+    // LOS in gimbal body frame (forward = +X, right = +Y, down = +Z convention
+    // mapped to NED: north, east, down).
+    let n_body = el.cos() * az.cos();
+    let e_body = el.cos() * az.sin();
+    let d_body = el.sin(); // positive down
+
+    // Apply platform attitude rotation: Rz(yaw) * Ry(pitch*sq) * Rx(roll*sq)
+    let sq = stabilization_quality as f64;
+    let roll  = (platform_roll  as f64) * sq;
+    let pitch = (platform_pitch as f64) * sq;
+    let yaw   = platform_yaw as f64;
+
+    let (sr, cr) = roll.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let (sy, cy) = yaw.sin_cos();
+
+    // Rz(yaw) * Ry(pitch) * Rx(roll) rotation matrix applied to [n_body, e_body, d_body]:
+    // Row 0: [cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr]
+    // Row 1: [sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr]
+    // Row 2: [-sp,    cp*sr,             cp*cr            ]
+    let n = (cy * cp) * n_body + (cy * sp * sr - sy * cr) * e_body + (cy * sp * cr + sy * sr) * d_body;
+    let e = (sy * cp) * n_body + (sy * sp * sr + cy * cr) * e_body + (sy * sp * cr - cy * sr) * d_body;
+    let d = (-sp)     * n_body + (cp * sr)                * e_body + (cp * cr)                * d_body;
 
     let (n_hat, e_hat, d_hat) = ned_frame(lat, lon);
     let x = n_hat[0] * n + e_hat[0] * e + d_hat[0] * d;
@@ -127,6 +155,9 @@ pub fn compute_look_point(
     pos_lon: f64,
     pos_alt: f64,
     platform_yaw: f32,
+    platform_roll: f32,
+    platform_pitch: f32,
+    stabilization_quality: f32,
     pan: f32,
     tilt: f32,
 ) -> Option<[f64; 3]> {
@@ -134,7 +165,7 @@ pub fn compute_look_point(
         return None; // on the ground, no look-point
     }
     let origin = geodetic_to_ecef(pos_lat, pos_lon, pos_alt);
-    let dir_f32 = los_ecef(pos_lat, pos_lon, platform_yaw, pan, tilt);
+    let dir_f32 = los_ecef(pos_lat, pos_lon, platform_yaw, platform_roll, platform_pitch, stabilization_quality, pan, tilt);
     let dir = [dir_f32[0] as f64, dir_f32[1] as f64, dir_f32[2] as f64];
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if len < 1e-10 {
@@ -230,7 +261,7 @@ mod tests {
         let lat = 37.0_f64.to_radians();
         let lon = -122.0_f64.to_radians();
         let alt = 1000.0;
-        let result = compute_look_point(lat, lon, alt, 0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        let result = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2);
         let [rl, ro, ra] = result.expect("should intersect");
         assert!((rl - lat).abs() < 1e-5, "look lat should match platform lat");
         assert!((ro - lon).abs() < 1e-5, "look lon should match platform lon");
@@ -245,7 +276,7 @@ mod tests {
         // Compute look point forward and to the right
         let pan0 = 0.5_f32;
         let tilt0 = 0.7_f32; // 40° depression
-        if let Some([tl, to, ta]) = compute_look_point(pos_lat, pos_lon, pos_alt, 0.0, pan0, tilt0) {
+        if let Some([tl, to, ta]) = compute_look_point(pos_lat, pos_lon, pos_alt, 0.0, 0.0, 0.0, 0.0, pan0, tilt0) {
             let (pan1, tilt1) = inverse_geopoint(pos_lat, pos_lon, pos_alt, 0.0, tl, to, ta);
             assert!((pan1 - pan0).abs() < 0.01, "pan inverse: {} vs {}", pan1, pan0);
             assert!((tilt1 - tilt0).abs() < 0.01, "tilt inverse: {} vs {}", tilt1, tilt0);
@@ -269,5 +300,96 @@ mod tests {
         assert!((pan0 - pan500).abs() < 0.01, "pan should be similar: {} vs {}", pan0, pan500);
         // Higher target → less depression (smaller tilt).
         assert!(tilt500 < tilt0, "higher target alt should reduce tilt: {} vs {}", tilt500, tilt0);
+    }
+
+    #[test]
+    fn stabilization_quality_zero_matches_yaw_only() {
+        // With stab_quality=0.0, roll and pitch should have no effect,
+        // matching the old yaw-only behavior.
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 1000.0;
+        let yaw = 0.3_f32;
+        let pan = 0.5_f32;
+        let tilt = 0.7_f32;
+
+        let result_no_rp = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 0.0, pan, tilt);
+        // Non-zero roll/pitch but stab_quality = 0.0 → should be identical
+        let result_with_rp = compute_look_point(lat, lon, alt, yaw, 0.2, -0.1, 0.0, pan, tilt);
+        let a = result_no_rp.expect("should intersect");
+        let b = result_with_rp.expect("should intersect");
+        assert!((a[0] - b[0]).abs() < 1e-10, "lat should match: {} vs {}", a[0], b[0]);
+        assert!((a[1] - b[1]).abs() < 1e-10, "lon should match: {} vs {}", a[1], b[1]);
+        assert!((a[2] - b[2]).abs() < 0.01, "alt should match: {} vs {}", a[2], b[2]);
+    }
+
+    #[test]
+    fn stabilization_quality_one_shifts_look_point_with_roll() {
+        // With stab_quality=1.0 and nonzero roll, the look-point should differ
+        // from the zero-roll case.
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 1000.0;
+        let yaw = 0.0_f32;
+        let pan = 0.0_f32;
+        let tilt = std::f32::consts::FRAC_PI_4; // 45° depression
+
+        let result_no_roll = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt);
+        // Apply 10° roll
+        let roll = 10.0_f32.to_radians();
+        let result_with_roll = compute_look_point(lat, lon, alt, yaw, roll, 0.0, 1.0, pan, tilt);
+
+        let a = result_no_roll.expect("should intersect");
+        let b = result_with_roll.expect("should intersect");
+        // The look-point should have shifted (lat or lon differs meaningfully)
+        let dlat = (a[0] - b[0]).abs();
+        let dlon = (a[1] - b[1]).abs();
+        let shift = dlat + dlon;
+        assert!(shift > 1e-6, "look-point should shift with roll: dlat={}, dlon={}", dlat, dlon);
+    }
+
+    #[test]
+    fn stabilization_quality_one_shifts_look_point_with_pitch() {
+        // With stab_quality=1.0 and nonzero pitch, the look-point should differ.
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 1000.0;
+        let yaw = 0.0_f32;
+        let pan = 0.0_f32;
+        let tilt = std::f32::consts::FRAC_PI_4;
+
+        let result_no_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, 0.0, 1.0, pan, tilt);
+        let pitch = 5.0_f32.to_radians();
+        let result_with_pitch = compute_look_point(lat, lon, alt, yaw, 0.0, pitch, 1.0, pan, tilt);
+
+        let a = result_no_pitch.expect("should intersect");
+        let b = result_with_pitch.expect("should intersect");
+        let dlat = (a[0] - b[0]).abs();
+        let dlon = (a[1] - b[1]).abs();
+        let shift = dlat + dlon;
+        assert!(shift > 1e-6, "look-point should shift with pitch: dlat={}, dlon={}", dlat, dlon);
+    }
+
+    #[test]
+    fn stabilization_quality_half_partial_effect() {
+        // stab_quality=0.5 should produce a shift that is less than stab_quality=1.0
+        let lat = 37.0_f64.to_radians();
+        let lon = -122.0_f64.to_radians();
+        let alt = 1000.0;
+        let roll = 10.0_f32.to_radians();
+        let pan = 0.0_f32;
+        let tilt = std::f32::consts::FRAC_PI_4;
+
+        let base = compute_look_point(lat, lon, alt, 0.0, 0.0, 0.0, 0.0, pan, tilt)
+            .expect("intersect");
+        let half = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 0.5, pan, tilt)
+            .expect("intersect");
+        let full = compute_look_point(lat, lon, alt, 0.0, roll, 0.0, 1.0, pan, tilt)
+            .expect("intersect");
+
+        let shift_half = (base[0] - half[0]).abs() + (base[1] - half[1]).abs();
+        let shift_full = (base[0] - full[0]).abs() + (base[1] - full[1]).abs();
+        assert!(shift_half > 1e-7, "half quality should produce a shift");
+        assert!(shift_full > shift_half, "full quality should shift more than half: {} vs {}", shift_full, shift_half);
     }
 }

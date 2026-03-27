@@ -450,6 +450,8 @@ impl GimbalSimulator {
         if let Some([ll, lo, la]) = geo::compute_look_point(
             self.pos_lat, self.pos_lon, self.pos_alt,
             self.platform_yaw,
+            self.platform_roll, self.platform_pitch,
+            self.config.stabilization_quality,
             self.pan, self.tilt,
         ) {
             self.look_lat = ll;
@@ -594,6 +596,9 @@ impl GimbalSimulator {
             self.pos_lat,
             self.pos_lon,
             self.platform_yaw,
+            self.platform_roll,
+            self.platform_pitch,
+            self.config.stabilization_quality,
             self.pan,
             self.tilt,
         );

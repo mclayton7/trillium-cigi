@@ -66,6 +66,12 @@ pub struct Config {
     /// White-noise floor (rad RMS). Default: ~0.01° ≈ 0.175 mrad.
     pub noise_floor: f32,
 
+    // ── Stabilization ─────────────────────────────────────
+    /// Stabilization quality factor: 0.0 = perfect inertial stabilization
+    /// (roll/pitch have no effect on LOS), 1.0 = fully body-mounted (full
+    /// roll/pitch coupling).  Default: 0.0 (Orion is inertially stabilized).
+    pub stabilization_quality: f32,
+
     // ── Geopoint ──────────────────────────────────────────
     /// Default target altitude (metres) for geopoint mode. Default: 0.0.
     pub geopoint_alt_m: f64,
@@ -115,6 +121,7 @@ impl Default for Config {
             jitter_freq: 10.0,
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
+            stabilization_quality: 0.0,
             geopoint_alt_m: 0.0,
             platform_source: "static".to_string(),
             mavlink_listen_port: 14550,
@@ -177,6 +184,9 @@ impl Config {
                 }
                 "noise_floor_deg" => {
                     if let Ok(v) = val.parse::<f32>() { cfg.noise_floor = v.to_radians(); }
+                }
+                "stabilization_quality" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.stabilization_quality = v.clamp(0.0, 1.0); }
                 }
                 "geopoint_alt_m" => {
                     if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }
