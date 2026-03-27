@@ -361,15 +361,17 @@ impl GimbalSimulator {
                 }
 
                 OrionMode::OrionModeRate => {
-                    // Integrate commanded rate; only clamp pan when there's a hard stop.
-                    self.pan += self.pan_rate_cmd * dt;
+                    // Ramp actual rate toward commanded rate, limited by max_accel.
+                    self.pan_rate = ramp_rate(self.pan_rate, self.pan_rate_cmd, self.config.max_accel, dt);
+                    self.tilt_rate = ramp_rate(self.tilt_rate, self.tilt_rate_cmd, self.config.max_accel, dt);
+
+                    // Integrate actual (ramped) rate into position.
+                    self.pan += self.pan_rate * dt;
                     if !self.config.is_continuous_pan() {
                         self.pan = self.pan.clamp(-self.config.pan_limit, self.config.pan_limit);
                     }
-                    self.tilt = (self.tilt + self.tilt_rate_cmd * dt)
+                    self.tilt = (self.tilt + self.tilt_rate * dt)
                         .clamp(self.config.tilt_min, self.config.tilt_max);
-                    self.pan_rate = self.pan_rate_cmd;
-                    self.tilt_rate = self.tilt_rate_cmd;
                 }
 
                 OrionMode::OrionModeGeopoint => {
@@ -507,6 +509,19 @@ fn tick_axis_trap(
     } else if dir < 0.0 && *pos < target {
         *pos = target;
         *rate = 0.0;
+    }
+}
+
+/// Ramp `current` toward `target` rate, limited by `max_accel` (rad/s²).
+///
+/// Returns the new rate after applying at most `max_accel * dt` change.
+fn ramp_rate(current: f32, target: f32, max_accel: f32, dt: f32) -> f32 {
+    let delta = target - current;
+    let max_delta = max_accel * dt;
+    if delta.abs() <= max_delta {
+        target
+    } else {
+        current + delta.signum() * max_delta
     }
 }
 
@@ -784,6 +799,53 @@ mod tests {
             (sim.pan - rate).abs() < 1e-4,
             "pan should have integrated to rate*dt: {}",
             sim.pan
+        );
+    }
+
+    #[test]
+    fn rate_mode_accel_limited() {
+        // With a small dt, the rate should ramp toward the commanded rate
+        // rather than jumping to it instantly.
+        let mut sim = GimbalSimulator::default();
+        let sc = crate::cigi::messages::SensorControl {
+            sensor_state: 1,
+            track_mode: 1, // → rate mode
+            gain: 1.0,     // → pan_rate_cmd = +max_slew_rate (~1.047 rad/s)
+            level: 0.5,    // → tilt_rate_cmd = 0
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+        assert!(matches!(sim.mode, OrionMode::OrionModeRate));
+
+        let commanded = sim.pan_rate_cmd;
+        assert!(commanded > 0.0);
+
+        // One tick at 50 Hz (0.02 s). max_accel = 300 deg/s^2 = 5.236 rad/s^2.
+        // After one tick: rate = max_accel * dt = 5.236 * 0.02 = 0.1047 rad/s.
+        // Commanded rate = max_slew_rate = 1.047 rad/s.
+        // So the rate should be well below the commanded rate after one tick.
+        sim.tick(0.02);
+        let rate_after_one = sim.pan_rate;
+        assert!(
+            rate_after_one < commanded,
+            "rate ({}) should be less than commanded ({}) after 1 tick",
+            rate_after_one,
+            commanded
+        );
+        assert!(
+            rate_after_one > 0.0,
+            "rate should be positive and ramping up"
+        );
+
+        // After enough ticks, the rate should reach the commanded value.
+        for _ in 0..500 {
+            sim.tick(0.02);
+        }
+        assert!(
+            (sim.pan_rate - commanded).abs() < 1e-4,
+            "rate ({}) should have converged to commanded ({})",
+            sim.pan_rate,
+            commanded
         );
     }
 
