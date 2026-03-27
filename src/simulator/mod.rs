@@ -28,9 +28,6 @@ use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
 /// Default maximum slew rate (rad/s) = 60 °/s.  Matches Config::default().
 pub const MAX_SLEW_RATE: f32 = 1.047_198; // 60°/s in rad/s
 
-/// Proportional gain for track-mode controller (rad/s per rad of image error).
-const K_TRACK: f32 = 3.0;
-
 /// Camera switch blackout duration (frames at 50 Hz).
 const CAMERA_SWITCH_FRAMES: u8 = 10; // 200 ms
 
@@ -97,6 +94,9 @@ pub struct GimbalSimulator {
     /// Track target offset from image centre (−0.5 to +0.5, fractional).
     pub track_target: [f32; 2],
     pub track_active: bool,
+    /// Previous frame track offsets for derivative calculation.
+    prev_track_x: f32,
+    prev_track_y: f32,
 
     // ── Vibration ────────────────────────────────────────────────────
     jitter_phase: f32, // accumulated cycles
@@ -159,6 +159,8 @@ impl Default for GimbalSimulator {
             geopoint_alt: 0.0,
             track_target: [0.0; 2],
             track_active: false,
+            prev_track_x: 0.0,
+            prev_track_y: 0.0,
             jitter_phase: 0.0,
             noise_seed: 0xDEAD_BEEF,
             pan_jitter: 0.0,
@@ -402,9 +404,14 @@ impl GimbalSimulator {
 
                 OrionMode::OrionModeTrack => {
                     if self.track_active {
-                        // Proportional controller: image offset → angular rate.
-                        let pr = K_TRACK * self.track_target[0] * self.hfov;
-                        let tr = K_TRACK * self.track_target[1] * self.vfov;
+                        let kp = self.config.track_p_gain;
+                        let kd = self.config.track_d_gain;
+                        // Derivative of track offset (change per second).
+                        let dx = (self.track_target[0] - self.prev_track_x) / dt;
+                        let dy = (self.track_target[1] - self.prev_track_y) / dt;
+                        // PD controller: image offset → angular rate.
+                        let pr = (kp * self.track_target[0] + kd * dx) * self.hfov;
+                        let tr = (kp * self.track_target[1] + kd * dy) * self.vfov;
                         self.pan += pr * dt;
                         self.tilt += tr * dt;
                         if !self.config.is_continuous_pan() {
@@ -414,12 +421,16 @@ impl GimbalSimulator {
                         self.pan_rate = pr;
                         self.tilt_rate = tr;
                         // Track loss when target approaches FOV edge.
-                        if self.track_target[0].abs() > 0.45
-                            || self.track_target[1].abs() > 0.45
+                        let threshold = self.config.track_loss_threshold;
+                        if self.track_target[0].abs() > threshold
+                            || self.track_target[1].abs() > threshold
                         {
                             self.track_active = false;
                         }
                     }
+                    // Update previous track offsets for next derivative.
+                    self.prev_track_x = self.track_target[0];
+                    self.prev_track_y = self.track_target[1];
                 }
 
                 _ => {
@@ -1036,6 +1047,79 @@ mod tests {
         sim.tick(0.02);
 
         assert!(sim.track_active, "track should remain active below threshold");
+    }
+
+    #[test]
+    fn track_mode_pd_differs_from_pure_p() {
+        // With a changing track offset, the derivative term should produce
+        // a different rate than pure proportional would.
+        let mut cfg = Config::default();
+        cfg.track_p_gain = 3.0;
+        cfg.track_d_gain = 0.5;
+        let mut sim_pd = GimbalSimulator::with_config(cfg.clone());
+        sim_pd.mode = OrionMode::OrionModeTrack;
+        sim_pd.track_active = true;
+
+        // First tick: set initial offset.
+        sim_pd.track_target = [0.1, 0.0];
+        sim_pd.tick(0.02);
+        let _pan_after_first = sim_pd.pan;
+
+        // Second tick: offset increases → derivative should add to rate.
+        sim_pd.track_target = [0.2, 0.0];
+        sim_pd.tick(0.02);
+        let pan_pd = sim_pd.pan;
+
+        // Compare with pure-P (K_D = 0).
+        cfg.track_d_gain = 0.0;
+        let mut sim_p = GimbalSimulator::with_config(cfg);
+        sim_p.mode = OrionMode::OrionModeTrack;
+        sim_p.track_active = true;
+
+        sim_p.track_target = [0.1, 0.0];
+        sim_p.tick(0.02);
+        sim_p.track_target = [0.2, 0.0];
+        sim_p.tick(0.02);
+        let pan_p = sim_p.pan;
+
+        // PD should move further than pure-P when offset is increasing.
+        assert!(
+            (pan_pd - pan_p).abs() > 1e-6,
+            "PD controller should produce different result from pure-P: pd={}, p={}",
+            pan_pd,
+            pan_p
+        );
+        assert!(
+            pan_pd > pan_p,
+            "PD should move further when offset is increasing: pd={}, p={}",
+            pan_pd,
+            pan_p
+        );
+    }
+
+    #[test]
+    fn track_mode_configurable_loss_threshold() {
+        // With a higher threshold, an offset of 0.46 should NOT cause track loss.
+        let mut cfg = Config::default();
+        cfg.track_loss_threshold = 0.5;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.46, 0.0];
+
+        sim.tick(0.02);
+        assert!(sim.track_active, "track should stay active with higher threshold");
+
+        // With a lower threshold, an offset of 0.3 should cause track loss.
+        let mut cfg2 = Config::default();
+        cfg2.track_loss_threshold = 0.25;
+        let mut sim2 = GimbalSimulator::with_config(cfg2);
+        sim2.mode = OrionMode::OrionModeTrack;
+        sim2.track_active = true;
+        sim2.track_target = [0.3, 0.0];
+
+        sim2.tick(0.02);
+        assert!(!sim2.track_active, "track should be lost with lower threshold");
     }
 
     // ── Vibration ─────────────────────────────────────────────────────────

@@ -76,6 +76,14 @@ pub struct Config {
     /// Default target altitude (metres) for geopoint mode. Default: 0.0.
     pub geopoint_alt_m: f64,
 
+    // ── Track mode ──────────────────────────────────────────
+    /// Proportional gain for track-mode controller. Default: 3.0.
+    pub track_p_gain: f32,
+    /// Derivative gain for track-mode controller. Default: 0.5.
+    pub track_d_gain: f32,
+    /// Track loss threshold (fractional FOV, 0–1). Default: 0.45.
+    pub track_loss_threshold: f32,
+
     // ── Platform source ───────────────────────────────
     /// Platform data source: "static" (default), "mavlink", or "stanag4586".
     pub platform_source: String,
@@ -123,6 +131,9 @@ impl Default for Config {
             noise_floor: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
             geopoint_alt_m: 0.0,
+            track_p_gain: 3.0,
+            track_d_gain: 0.5,
+            track_loss_threshold: 0.45,
             platform_source: "static".to_string(),
             mavlink_listen_port: 14550,
             mavlink_system_id: 0,
@@ -190,6 +201,15 @@ impl Config {
                 }
                 "geopoint_alt_m" => {
                     if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }
+                }
+                "track_p_gain" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.track_p_gain = v; }
+                }
+                "track_d_gain" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.track_d_gain = v; }
+                }
+                "track_loss_threshold" => {
+                    if let Ok(v) = val.parse::<f32>() { cfg.track_loss_threshold = v.clamp(0.0, 1.0); }
                 }
                 "orion_listen_port" => {
                     if let Ok(v) = val.parse::<u16>() { cfg.orion_listen_port = v; }
