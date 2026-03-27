@@ -319,10 +319,15 @@ impl Config {
     }
 
     /// HFOV/VFOV interpolated by zoom level in [0, 1] (0 = wide, 1 = narrow).
+    ///
+    /// Uses a logarithmic (exponential) curve that models real optical zoom:
+    /// `fov = fov_wide * (fov_narrow / fov_wide).powf(zoom)`.
+    /// This gives perceptually uniform zoom speed — the same zoom increment
+    /// produces the same proportional FOV change anywhere in the range.
     pub fn fov_at_zoom(&self, zoom: f32) -> (f32, f32) {
         let t = zoom.clamp(0.0, 1.0);
-        let hfov = self.hfov_wide + t * (self.hfov_narrow - self.hfov_wide);
-        let vfov = self.vfov_wide + t * (self.vfov_narrow - self.vfov_wide);
+        let hfov = self.hfov_wide * (self.hfov_narrow / self.hfov_wide).powf(t);
+        let vfov = self.vfov_wide * (self.vfov_narrow / self.vfov_wide).powf(t);
         (hfov, vfov)
     }
 }
@@ -350,8 +355,8 @@ impl Config {
             self.camera_table[0]
         };
         let t = zoom.clamp(0.0, 1.0);
-        let hfov = entry.0 + t * (entry.2 - entry.0);
-        let vfov = entry.1 + t * (entry.3 - entry.1);
+        let hfov = entry.0 * (entry.2 / entry.0).powf(t);
+        let vfov = entry.1 * (entry.3 / entry.1).powf(t);
         (hfov.to_radians(), vfov.to_radians())
     }
 }
@@ -536,11 +541,21 @@ mod tests {
     }
 
     #[test]
-    fn fov_at_zoom_half_is_midpoint() {
+    fn fov_at_zoom_half_is_geometric_mean() {
+        // With logarithmic zoom, zoom=0.5 yields the geometric mean (sqrt(wide*narrow)),
+        // NOT the arithmetic mean ((wide+narrow)/2).
         let cfg = Config::default();
         let (h, v) = cfg.fov_at_zoom(0.5);
-        assert!((h - (cfg.hfov_wide + cfg.hfov_narrow) / 2.0).abs() < 1e-6);
-        assert!((v - (cfg.vfov_wide + cfg.vfov_narrow) / 2.0).abs() < 1e-6);
+        let h_geo = (cfg.hfov_wide * cfg.hfov_narrow).sqrt();
+        let v_geo = (cfg.vfov_wide * cfg.vfov_narrow).sqrt();
+        assert!((h - h_geo).abs() < 1e-6, "hfov at zoom 0.5 should be geometric mean");
+        assert!((v - v_geo).abs() < 1e-6, "vfov at zoom 0.5 should be geometric mean");
+
+        // Verify it is NOT the arithmetic mean.
+        let h_arith = (cfg.hfov_wide + cfg.hfov_narrow) / 2.0;
+        let v_arith = (cfg.vfov_wide + cfg.vfov_narrow) / 2.0;
+        assert!((h - h_arith).abs() > 1e-3, "should differ from arithmetic mean");
+        assert!((v - v_arith).abs() > 1e-3, "should differ from arithmetic mean");
     }
 
     #[test]
@@ -637,9 +652,9 @@ mod tests {
         assert!((h - 3.0_f32.to_radians()).abs() < 1e-5);
         assert!((v - 2.25_f32.to_radians()).abs() < 1e-5);
 
-        // Zoom 0.5 → midpoint
+        // Zoom 0.5 → geometric mean (logarithmic zoom curve)
         let (h, _) = cfg.fov_at_zoom_for_camera(2, 0.5);
-        let expected: f32 = (29.0 + 3.0) / 2.0;
+        let expected: f32 = (29.0_f32 * 3.0_f32).sqrt();
         assert!((h - expected.to_radians()).abs() < 1e-5);
     }
 
