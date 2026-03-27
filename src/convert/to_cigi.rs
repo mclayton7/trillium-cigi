@@ -21,8 +21,8 @@ pub fn telemetry_to_sensor_extended_response(
         sensor_status: orion_mode_to_sensor_status(telem.mode),
         gate_x_size: 20,
         gate_y_size: 20,
-        gate_x_pos: telem.pan.to_degrees(),
-        gate_y_pos: telem.tilt.to_degrees(),
+        gate_x_pos: 0.0,
+        gate_y_pos: 0.0,
         frame_ctr: telem.system_time,
         entity_id_valid: false,
         entity_id: 0,
@@ -133,13 +133,16 @@ mod tests {
     // ── telemetry_to_sensor_extended_response ────────────────────────────────
 
     #[test]
-    fn telem_pan_tilt_rad_to_deg() {
+    fn telem_gate_pos_boresighted() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pan = PI32 / 4.0;
         t.tilt = -PI32 / 6.0;
         let r = telemetry_to_sensor_extended_response(&t, 0, 0);
-        assert!((r.gate_x_pos - 45.0).abs() < 1e-4, "gate_x_pos={}", r.gate_x_pos);
-        assert!((r.gate_y_pos - (-30.0)).abs() < 1e-4, "gate_y_pos={}", r.gate_y_pos);
+        // Per CIGI v3.3, gate positions are image-plane centroids, not pan/tilt.
+        // The base conversion sets them to 0.0 (bore-sighted); the simulator
+        // overrides them for track mode in to_sensor_extended_response().
+        assert_eq!(r.gate_x_pos, 0.0);
+        assert_eq!(r.gate_y_pos, 0.0);
     }
 
     #[test]

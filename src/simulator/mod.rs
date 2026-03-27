@@ -698,6 +698,19 @@ impl GimbalSimulator {
             resp.entity_lon = 0.0;
             resp.entity_alt = 0.0;
         }
+
+        // Per CIGI v3.3, gate_x_pos/gate_y_pos are the tracking gate centroid
+        // position on the image plane, not gimbal pan/tilt angles.
+        // In track mode, use the fractional track target offsets (-0.5 to +0.5).
+        // In all other modes, the gate is bore-sighted (0.0, 0.0).
+        if self.mode == OrionMode::OrionModeTrack {
+            resp.gate_x_pos = self.track_target[0];
+            resp.gate_y_pos = self.track_target[1];
+        } else {
+            resp.gate_x_pos = 0.0;
+            resp.gate_y_pos = 0.0;
+        }
+
         resp
     }
 
@@ -814,9 +827,42 @@ mod tests {
             sim.tick(0.1);
         }
         let sr = sim.to_sensor_extended_response();
-        // Pan target was 0.5π rad ≈ 90°; tilt target was 0 rad.
-        assert!((sr.gate_x_pos - 90.0).abs() < 1.0, "gate_x_pos={}", sr.gate_x_pos);
-        assert!(sr.gate_y_pos.abs() < 1.0, "gate_y_pos={}", sr.gate_y_pos);
+        // Position mode: gate fields should be bore-sighted (0.0).
+        assert_eq!(sr.gate_x_pos, 0.0, "gate_x_pos should be 0 in position mode");
+        assert_eq!(sr.gate_y_pos, 0.0, "gate_y_pos should be 0 in position mode");
+    }
+
+    #[test]
+    fn gate_pos_track_mode_uses_track_target() {
+        let mut sim = GimbalSimulator::default();
+        // Put simulator in track mode
+        let sc = crate::cigi::messages::SensorControl {
+            sensor_state: 2, // Track
+            gain: 0.7,       // track_target[0] = 0.7 - 0.5 = 0.2
+            level: 0.6,      // track_target[1] = 0.6 - 0.5 = 0.1
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+        sim.tick(0.02);
+        let sr = sim.to_sensor_extended_response();
+        assert!((sr.gate_x_pos - 0.2).abs() < 1e-5, "gate_x_pos={}", sr.gate_x_pos);
+        assert!((sr.gate_y_pos - 0.1).abs() < 1e-5, "gate_y_pos={}", sr.gate_y_pos);
+    }
+
+    #[test]
+    fn gate_pos_position_mode_is_boresighted() {
+        let mut sim = GimbalSimulator::default();
+        let sc = crate::cigi::messages::SensorControl {
+            sensor_state: 1, // Position mode
+            gain: 0.75,
+            level: 0.5,
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+        sim.tick(0.02);
+        let sr = sim.to_sensor_extended_response();
+        assert_eq!(sr.gate_x_pos, 0.0);
+        assert_eq!(sr.gate_y_pos, 0.0);
     }
 
     #[test]

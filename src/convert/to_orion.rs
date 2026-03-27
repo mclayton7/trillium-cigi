@@ -11,20 +11,21 @@ use crate::platform::PlatformState;
 /// Field mapping:
 /// | CIGI field          | Orion field   | Conversion      |
 /// |---------------------|---------------|-----------------|
-/// | gate_x_pos (deg)    | pan (rad)     | × π/180         |
-/// | gate_y_pos (deg)    | tilt (rad)    | × π/180         |
 /// | entity_lat (deg)    | pos_lat (rad) | × π/180         |
 /// | entity_lon (deg)    | pos_lon (rad) | × π/180         |
 /// | entity_alt (m)      | pos_alt (m)   | direct          |
 /// | sensor_status       | mode          | 0→Position, 1→Track, 3→Disabled |
+///
+/// Note: gate_x_pos/gate_y_pos are CIGI v3.3 tracking gate centroid positions,
+/// NOT gimbal pan/tilt angles. Pan/tilt on the scene-generator path come from
+/// the IG itself; the simulator fallback path populates them in `to_telemetry()`.
 pub fn sensor_response_to_telemetry(
     resp: &SensorExtendedResponse,
     _platform: &PlatformState,
 ) -> GeolocateTelemetryCorePacket {
     let rad_per_deg = std::f64::consts::PI / 180.0;
     let mut pkt = GeolocateTelemetryCorePacket::default();
-    pkt.pan = resp.gate_x_pos.to_radians();
-    pkt.tilt = resp.gate_y_pos.to_radians();
+    // pan and tilt are left at default (0.0) — they are not derived from gate fields.
     pkt.pos_lat = resp.entity_lat * rad_per_deg;
     pkt.pos_lon = resp.entity_lon * rad_per_deg;
     pkt.pos_alt = resp.entity_alt;
@@ -45,8 +46,8 @@ mod tests {
     #[test]
     fn sensor_response_to_telemetry_basic() {
         let resp = SensorExtendedResponse {
-            gate_x_pos: 45.0,  // degrees pan
-            gate_y_pos: -10.0, // degrees tilt
+            gate_x_pos: 0.25,  // tracking gate centroid, not pan
+            gate_y_pos: -0.1,  // tracking gate centroid, not tilt
             entity_lat: 38.8977,
             entity_lon: -77.0365,
             entity_alt: 100.0,
@@ -54,10 +55,21 @@ mod tests {
             ..SensorExtendedResponse::default()
         };
         let telem = sensor_response_to_telemetry(&resp, &PlatformState::default());
-        assert!((telem.pan - 45.0_f32.to_radians()).abs() < 1e-5);
-        assert!((telem.tilt - (-10.0_f32).to_radians()).abs() < 1e-5);
         assert!((telem.pos_alt - 100.0).abs() < 0.1);
         assert_eq!(telem.mode, crate::orion::OrionMode::OrionModePosition);
+    }
+
+    #[test]
+    fn sensor_response_does_not_extract_pan_tilt_from_gate() {
+        let resp = SensorExtendedResponse {
+            gate_x_pos: 0.3,
+            gate_y_pos: -0.2,
+            ..SensorExtendedResponse::default()
+        };
+        let telem = sensor_response_to_telemetry(&resp, &PlatformState::default());
+        // Pan and tilt must remain at default (0.0), not derived from gate fields.
+        assert_eq!(telem.pan, 0.0);
+        assert_eq!(telem.tilt, 0.0);
     }
 
     #[test]
