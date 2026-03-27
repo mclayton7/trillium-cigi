@@ -17,7 +17,7 @@
 use std::f32::consts::PI;
 
 use crate::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse, StartOfFrame};
-use crate::config::{Config, camera_fov};
+use crate::config::Config;
 use crate::faults::{FaultState, lcg_noise_f32};
 use crate::geo;
 use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
@@ -27,9 +27,6 @@ use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
 #[allow(dead_code)]
 /// Default maximum slew rate (rad/s) = 60 °/s.  Matches Config::default().
 pub const MAX_SLEW_RATE: f32 = 1.047_198; // 60°/s in rad/s
-
-/// Proportional gain for track-mode controller (rad/s per rad of image error).
-const K_TRACK: f32 = 3.0;
 
 /// Camera switch blackout duration (frames at 50 Hz).
 const CAMERA_SWITCH_FRAMES: u8 = 10; // 200 ms
@@ -97,6 +94,9 @@ pub struct GimbalSimulator {
     /// Track target offset from image centre (−0.5 to +0.5, fractional).
     pub track_target: [f32; 2],
     pub track_active: bool,
+    /// Previous frame track offsets for derivative calculation.
+    prev_track_x: f32,
+    prev_track_y: f32,
 
     // ── Vibration ────────────────────────────────────────────────────
     jitter_phase: f32, // accumulated cycles
@@ -104,6 +104,11 @@ pub struct GimbalSimulator {
     /// Instantaneous jitter added to pan for this frame's telemetry.
     pan_jitter: f32,
     tilt_jitter: f32,
+    /// Jitter-perturbed pan/tilt (clean angle + jitter).  Used for
+    /// look-point computation and telemetry so the reported LOS reflects
+    /// the physical vibration of the sensor.
+    pub pan_jittered: f32,
+    pub tilt_jittered: f32,
 
     // ── Diagnostics / faults ────────────────────────────────────────
     pub faults: FaultState,
@@ -123,7 +128,7 @@ pub struct GimbalSimulator {
 impl Default for GimbalSimulator {
     fn default() -> Self {
         let cfg = Config::default();
-        let (hfov, vfov) = cfg.fov_at_zoom(0.0);
+        let (hfov, vfov) = cfg.fov_at_zoom_for_camera(0, 0.0);
         Self {
             pan: 0.0,
             tilt: 0.0,
@@ -159,10 +164,14 @@ impl Default for GimbalSimulator {
             geopoint_alt: 0.0,
             track_target: [0.0; 2],
             track_active: false,
+            prev_track_x: 0.0,
+            prev_track_y: 0.0,
             jitter_phase: 0.0,
             noise_seed: 0xDEAD_BEEF,
             pan_jitter: 0.0,
             tilt_jitter: 0.0,
+            pan_jittered: 0.0,
+            tilt_jittered: 0.0,
             faults: FaultState::default(),
             frame_ctr: 0,
             system_time_ms: 0,
@@ -178,7 +187,7 @@ impl Default for GimbalSimulator {
 impl GimbalSimulator {
     /// Create a simulator with a specific configuration.
     pub fn with_config(cfg: Config) -> Self {
-        let (hfov, vfov) = cfg.fov_at_zoom(0.0);
+        let (hfov, vfov) = cfg.fov_at_zoom_for_camera(0, 0.0);
         Self {
             hfov,
             vfov,
@@ -226,12 +235,15 @@ impl GimbalSimulator {
                 // In track mode, gain/level encode the track centroid offset (−0.5 to +0.5).
                 self.track_target = [sc.gain - 0.5, sc.level - 0.5];
                 self.track_active = true;
+                // Seed previous track values so the first tick's derivative is zero.
+                self.prev_track_x = self.track_target[0];
+                self.prev_track_y = self.track_target[1];
             }
             OrionMode::OrionModeGeopoint => {
                 // ac_coupling/noise encode full-Earth lat/lon as 0–1 fractions.
                 self.geopoint_lat = (sc.ac_coupling as f64 * 180.0 - 90.0).to_radians();
                 self.geopoint_lon = (sc.noise as f64 * 360.0 - 180.0).to_radians();
-                self.geopoint_alt = 0.0;
+                self.geopoint_alt = self.config.geopoint_alt_m;
             }
             _ => {
                 // Position mode: gain/level → pan/tilt targets in ±π, then clamped.
@@ -309,14 +321,14 @@ impl GimbalSimulator {
         let new_zoom = zoom.clamp(0.0, 1.0);
         if (new_zoom - self.zoom_level).abs() > 0.001 {
             self.zoom_level = new_zoom;
-            let (h, v) = self.config.fov_at_zoom(self.zoom_level);
+            let (h, v) = self.config.fov_at_zoom_for_camera(self.camera_index, self.zoom_level);
             self.hfov = h;
             self.vfov = v;
         }
     }
 
     fn update_camera_fov(&mut self) {
-        let (h_deg, v_deg) = camera_fov(self.camera_index);
+        let (h_deg, v_deg) = self.config.camera_fov(self.camera_index);
         self.hfov = h_deg.to_radians();
         self.vfov = v_deg.to_radians();
     }
@@ -338,6 +350,13 @@ impl GimbalSimulator {
         }
 
         // ── Motion (disabled when motor fault is active) ───────────
+        // Thermal throttling: halve effective slew rate when thermal warning is active.
+        let effective_slew_rate = if self.faults.thermal_warning {
+            self.config.max_slew_rate * 0.5
+        } else {
+            self.config.max_slew_rate
+        };
+
         if !self.faults.motor_fault {
             match self.mode {
                 OrionMode::OrionModePosition
@@ -347,7 +366,7 @@ impl GimbalSimulator {
                         &mut self.pan_rate,
                         self.target_pan,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                     tick_axis_trap(
@@ -355,21 +374,26 @@ impl GimbalSimulator {
                         &mut self.tilt_rate,
                         self.target_tilt,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                 }
 
                 OrionMode::OrionModeRate => {
-                    // Integrate commanded rate; only clamp pan when there's a hard stop.
-                    self.pan += self.pan_rate_cmd * dt;
+                    // Clamp commanded rate to effective slew rate.
+                    let pan_cmd = self.pan_rate_cmd.clamp(-effective_slew_rate, effective_slew_rate);
+                    let tilt_cmd = self.tilt_rate_cmd.clamp(-effective_slew_rate, effective_slew_rate);
+                    // Ramp actual rate toward commanded rate, limited by max_accel.
+                    self.pan_rate = ramp_rate(self.pan_rate, pan_cmd, self.config.max_accel, dt);
+                    self.tilt_rate = ramp_rate(self.tilt_rate, tilt_cmd, self.config.max_accel, dt);
+
+                    // Integrate actual (ramped) rate into position.
+                    self.pan += self.pan_rate * dt;
                     if !self.config.is_continuous_pan() {
                         self.pan = self.pan.clamp(-self.config.pan_limit, self.config.pan_limit);
                     }
-                    self.tilt = (self.tilt + self.tilt_rate_cmd * dt)
+                    self.tilt = (self.tilt + self.tilt_rate * dt)
                         .clamp(self.config.tilt_min, self.config.tilt_max);
-                    self.pan_rate = self.pan_rate_cmd;
-                    self.tilt_rate = self.tilt_rate_cmd;
                 }
 
                 OrionMode::OrionModeGeopoint => {
@@ -385,7 +409,7 @@ impl GimbalSimulator {
                         &mut self.pan_rate,
                         self.target_pan,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                     tick_axis_trap(
@@ -393,16 +417,21 @@ impl GimbalSimulator {
                         &mut self.tilt_rate,
                         self.target_tilt,
                         dt,
-                        self.config.max_slew_rate,
+                        effective_slew_rate,
                         self.config.max_accel,
                     );
                 }
 
                 OrionMode::OrionModeTrack => {
                     if self.track_active {
-                        // Proportional controller: image offset → angular rate.
-                        let pr = K_TRACK * self.track_target[0] * self.hfov;
-                        let tr = K_TRACK * self.track_target[1] * self.vfov;
+                        let kp = self.config.track_p_gain;
+                        let kd = self.config.track_d_gain;
+                        // Derivative of track offset (change per second).
+                        let dx = (self.track_target[0] - self.prev_track_x) / dt;
+                        let dy = (self.track_target[1] - self.prev_track_y) / dt;
+                        // PD controller: image offset → angular rate.
+                        let pr = (kp * self.track_target[0] + kd * dx) * self.hfov;
+                        let tr = (kp * self.track_target[1] + kd * dy) * self.vfov;
                         self.pan += pr * dt;
                         self.tilt += tr * dt;
                         if !self.config.is_continuous_pan() {
@@ -412,12 +441,16 @@ impl GimbalSimulator {
                         self.pan_rate = pr;
                         self.tilt_rate = tr;
                         // Track loss when target approaches FOV edge.
-                        if self.track_target[0].abs() > 0.45
-                            || self.track_target[1].abs() > 0.45
+                        let threshold = self.config.track_loss_threshold;
+                        if self.track_target[0].abs() > threshold
+                            || self.track_target[1].abs() > threshold
                         {
                             self.track_active = false;
                         }
                     }
+                    // Update previous track offsets for next derivative.
+                    self.prev_track_x = self.track_target[0];
+                    self.prev_track_y = self.track_target[1];
                 }
 
                 _ => {
@@ -444,11 +477,19 @@ impl GimbalSimulator {
         let tilt_sin = amp * ((self.jitter_phase + 0.25) * 2.0 * PI).sin();
         self.tilt_jitter = tilt_sin + n2;
 
+        // Store jitter-perturbed angles for look-point and telemetry.
+        self.pan_jittered = self.pan + self.pan_jitter;
+        self.tilt_jittered = self.tilt + self.tilt_jitter;
+
         // ── Geolocation ───────────────────────────────────────────
         if let Some([ll, lo, la]) = geo::compute_look_point(
             self.pos_lat, self.pos_lon, self.pos_alt,
             self.platform_yaw,
-            self.pan, self.tilt,
+            self.platform_roll, self.platform_pitch,
+            self.config.stabilization_quality,
+            self.pan_jittered, self.tilt_jittered,
+            self.config.refraction_enabled,
+            self.config.terrain_elevation_m,
         ) {
             self.look_lat = ll;
             self.look_lon = lo;
@@ -510,6 +551,19 @@ fn tick_axis_trap(
     }
 }
 
+/// Ramp `current` toward `target` rate, limited by `max_accel` (rad/s²).
+///
+/// Returns the new rate after applying at most `max_accel * dt` change.
+fn ramp_rate(current: f32, target: f32, max_accel: f32, dt: f32) -> f32 {
+    let delta = target - current;
+    let max_delta = max_accel * dt;
+    if delta.abs() <= max_delta {
+        target
+    } else {
+        current + delta.signum() * max_delta
+    }
+}
+
 // ─────────────────────────────────────────── hardware telemetry ──
 
 impl GimbalSimulator {
@@ -536,17 +590,39 @@ impl GimbalSimulator {
 impl GimbalSimulator {
     /// Build an Orion `GeolocateTelemetryCorePacket` from current state.
     pub fn to_telemetry(&self) -> GeolocateTelemetryCorePacket {
+        // We need a local copy of the noise seed for degraded GPS noise.
+        // This avoids requiring &mut self while keeping deterministic output
+        // per frame (seeded from the simulator's noise_seed snapshot).
+        let mut noise_seed = self.noise_seed;
+
         let mut pkt = GeolocateTelemetryCorePacket::default();
 
         pkt.system_time = self.system_time_ms;
-        pkt.pos_lat = if self.faults.gps_loss { 0.0 } else { self.pos_lat };
-        pkt.pos_lon = if self.faults.gps_loss { 0.0 } else { self.pos_lon };
-        pkt.pos_alt = if self.faults.gps_loss { 0.0 } else { self.pos_alt };
+        if self.faults.gps_loss {
+            pkt.pos_lat = 0.0;
+            pkt.pos_lon = 0.0;
+            pkt.pos_alt = 0.0;
+        } else if self.faults.degraded_gps {
+            let std = self.faults.gps_noise_std;
+            pkt.pos_lat = self.pos_lat + lcg_noise_f32(&mut noise_seed) as f64 * std;
+            pkt.pos_lon = self.pos_lon + lcg_noise_f32(&mut noise_seed) as f64 * std;
+            pkt.pos_alt = self.pos_alt + lcg_noise_f32(&mut noise_seed) as f64 * std;
+        } else {
+            pkt.pos_lat = self.pos_lat;
+            pkt.pos_lon = self.pos_lon;
+            pkt.pos_alt = self.pos_alt;
+        }
 
-        // Report pan/tilt with vibration superimposed.
-        // Normalise to (−π, π] so the wire value is always in range.
-        pkt.pan = wrap_angle(self.pan + self.pan_jitter);
-        pkt.tilt = self.tilt + self.tilt_jitter;
+        // Encoder fault: report frozen pan/tilt instead of actual values.
+        if self.faults.encoder_fault {
+            pkt.pan = wrap_angle(self.faults.frozen_pan);
+            pkt.tilt = self.faults.frozen_tilt;
+        } else {
+            // Report jitter-perturbed pan/tilt (pre-computed in tick()).
+            // Normalise to (−π, π] so the wire value is always in range.
+            pkt.pan = wrap_angle(self.pan_jittered);
+            pkt.tilt = self.tilt_jittered;
+        }
         pkt.hfov = self.hfov;
         pkt.vfov = self.vfov;
         pkt.mode = self.mode;
@@ -579,6 +655,9 @@ impl GimbalSimulator {
             self.pos_lat,
             self.pos_lon,
             self.platform_yaw,
+            self.platform_roll,
+            self.platform_pitch,
+            self.config.stabilization_quality,
             self.pan,
             self.tilt,
         );
@@ -788,6 +867,53 @@ mod tests {
     }
 
     #[test]
+    fn rate_mode_accel_limited() {
+        // With a small dt, the rate should ramp toward the commanded rate
+        // rather than jumping to it instantly.
+        let mut sim = GimbalSimulator::default();
+        let sc = crate::cigi::messages::SensorControl {
+            sensor_state: 1,
+            track_mode: 1, // → rate mode
+            gain: 1.0,     // → pan_rate_cmd = +max_slew_rate (~1.047 rad/s)
+            level: 0.5,    // → tilt_rate_cmd = 0
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+        assert!(matches!(sim.mode, OrionMode::OrionModeRate));
+
+        let commanded = sim.pan_rate_cmd;
+        assert!(commanded > 0.0);
+
+        // One tick at 50 Hz (0.02 s). max_accel = 300 deg/s^2 = 5.236 rad/s^2.
+        // After one tick: rate = max_accel * dt = 5.236 * 0.02 = 0.1047 rad/s.
+        // Commanded rate = max_slew_rate = 1.047 rad/s.
+        // So the rate should be well below the commanded rate after one tick.
+        sim.tick(0.02);
+        let rate_after_one = sim.pan_rate;
+        assert!(
+            rate_after_one < commanded,
+            "rate ({}) should be less than commanded ({}) after 1 tick",
+            rate_after_one,
+            commanded
+        );
+        assert!(
+            rate_after_one > 0.0,
+            "rate should be positive and ramping up"
+        );
+
+        // After enough ticks, the rate should reach the commanded value.
+        for _ in 0..500 {
+            sim.tick(0.02);
+        }
+        assert!(
+            (sim.pan_rate - commanded).abs() < 1e-4,
+            "rate ({}) should have converged to commanded ({})",
+            sim.pan_rate,
+            commanded
+        );
+    }
+
+    #[test]
     fn camera_switch_blackout() {
         let mut sim = GimbalSimulator::default();
         // Command camera 1
@@ -861,6 +987,76 @@ mod tests {
         assert!(sim.tilt > 0.0, "tilt should be positive (down), got {}", sim.tilt);
     }
 
+    #[test]
+    fn geopoint_nonzero_altitude_changes_tilt() {
+        // With a higher target altitude, the required tilt (depression) should be less
+        // because the target is closer in elevation to the platform.
+        let mut sim_low = GimbalSimulator::default();
+        sim_low.mode = OrionMode::OrionModeGeopoint;
+        sim_low.pos_lat = 35.0_f64.to_radians();
+        sim_low.pos_lon = 0.0;
+        sim_low.pos_alt = 1000.0;
+        sim_low.geopoint_lat = 30.0_f64.to_radians();
+        sim_low.geopoint_lon = 0.0;
+        sim_low.geopoint_alt = 0.0;
+
+        let mut sim_high = GimbalSimulator::default();
+        sim_high.mode = OrionMode::OrionModeGeopoint;
+        sim_high.pos_lat = 35.0_f64.to_radians();
+        sim_high.pos_lon = 0.0;
+        sim_high.pos_alt = 1000.0;
+        sim_high.geopoint_lat = 30.0_f64.to_radians();
+        sim_high.geopoint_lon = 0.0;
+        sim_high.geopoint_alt = 500.0; // target at 500m elevation
+
+        // Run enough ticks for the targets to converge.
+        for _ in 0..100 {
+            sim_low.tick(0.02);
+            sim_high.tick(0.02);
+        }
+
+        // Higher target altitude → less tilt depression (smaller tilt value).
+        assert!(
+            sim_high.tilt < sim_low.tilt,
+            "higher target alt should require less tilt depression: high={} vs low={}",
+            sim_high.tilt, sim_low.tilt
+        );
+    }
+
+    #[test]
+    fn geopoint_config_alt_used_as_default() {
+        // Verify that Config::geopoint_alt_m is applied when entering geopoint mode.
+        let mut cfg = Config::default();
+        cfg.geopoint_alt_m = 250.0;
+        cfg.platform_lat = 35.0_f64.to_radians();
+        cfg.platform_lon = 0.0;
+        cfg.platform_alt = 1000.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.mode = OrionMode::OrionModeGeopoint;
+        // Simulate receiving a SensorControl that sets geopoint mode.
+        let sc = crate::cigi::messages::SensorControl {
+            view_id: 0,
+            sensor_id: 0,
+            sensor_state: 4, // Geopoint mode
+            polarity: false,
+            line_of_sight_enable: false,
+            track_mode: 0,
+            response_type: false,
+            auto_gain: false,
+            track_polarity: false,
+            gain: 0.0,
+            level: 0.0,
+            ac_coupling: 0.5,  // lat fraction → 0° lat
+            noise: 0.5,       // lon fraction → 0° lon
+        };
+        sim.apply_sensor_control(&sc);
+        assert!(
+            (sim.geopoint_alt - 250.0).abs() < 1e-6,
+            "geopoint_alt should be set from config: got {}",
+            sim.geopoint_alt
+        );
+    }
+
     // ── Track mode ────────────────────────────────────────────────────────
 
     #[test]
@@ -899,6 +1095,79 @@ mod tests {
         sim.tick(0.02);
 
         assert!(sim.track_active, "track should remain active below threshold");
+    }
+
+    #[test]
+    fn track_mode_pd_differs_from_pure_p() {
+        // With a changing track offset, the derivative term should produce
+        // a different rate than pure proportional would.
+        let mut cfg = Config::default();
+        cfg.track_p_gain = 3.0;
+        cfg.track_d_gain = 0.5;
+        let mut sim_pd = GimbalSimulator::with_config(cfg.clone());
+        sim_pd.mode = OrionMode::OrionModeTrack;
+        sim_pd.track_active = true;
+
+        // First tick: set initial offset.
+        sim_pd.track_target = [0.1, 0.0];
+        sim_pd.tick(0.02);
+        let _pan_after_first = sim_pd.pan;
+
+        // Second tick: offset increases → derivative should add to rate.
+        sim_pd.track_target = [0.2, 0.0];
+        sim_pd.tick(0.02);
+        let pan_pd = sim_pd.pan;
+
+        // Compare with pure-P (K_D = 0).
+        cfg.track_d_gain = 0.0;
+        let mut sim_p = GimbalSimulator::with_config(cfg);
+        sim_p.mode = OrionMode::OrionModeTrack;
+        sim_p.track_active = true;
+
+        sim_p.track_target = [0.1, 0.0];
+        sim_p.tick(0.02);
+        sim_p.track_target = [0.2, 0.0];
+        sim_p.tick(0.02);
+        let pan_p = sim_p.pan;
+
+        // PD should move further than pure-P when offset is increasing.
+        assert!(
+            (pan_pd - pan_p).abs() > 1e-6,
+            "PD controller should produce different result from pure-P: pd={}, p={}",
+            pan_pd,
+            pan_p
+        );
+        assert!(
+            pan_pd > pan_p,
+            "PD should move further when offset is increasing: pd={}, p={}",
+            pan_pd,
+            pan_p
+        );
+    }
+
+    #[test]
+    fn track_mode_configurable_loss_threshold() {
+        // With a higher threshold, an offset of 0.46 should NOT cause track loss.
+        let mut cfg = Config::default();
+        cfg.track_loss_threshold = 0.5;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.46, 0.0];
+
+        sim.tick(0.02);
+        assert!(sim.track_active, "track should stay active with higher threshold");
+
+        // With a lower threshold, an offset of 0.3 should cause track loss.
+        let mut cfg2 = Config::default();
+        cfg2.track_loss_threshold = 0.25;
+        let mut sim2 = GimbalSimulator::with_config(cfg2);
+        sim2.mode = OrionMode::OrionModeTrack;
+        sim2.track_active = true;
+        sim2.track_target = [0.3, 0.0];
+
+        sim2.tick(0.02);
+        assert!(!sim2.track_active, "track should be lost with lower threshold");
     }
 
     // ── Vibration ─────────────────────────────────────────────────────────
@@ -996,6 +1265,215 @@ mod tests {
             "target_pan={} expected≈{}",
             sim.target_pan,
             expected
+        );
+    }
+
+    #[test]
+    fn jitter_affects_look_point() {
+        // Set up two simulators at altitude with a down-looking tilt so the
+        // LOS hits the ground.  One has high jitter amplitude; the other zero.
+        let mut cfg_jitter = Config::default();
+        cfg_jitter.jitter_amplitude = 0.05; // ~2.9 degrees — very noticeable
+        cfg_jitter.noise_floor = 0.02;
+
+        let mut cfg_clean = Config::default();
+        cfg_clean.jitter_amplitude = 0.0;
+        cfg_clean.noise_floor = 0.0;
+
+        let mut sim_jitter = GimbalSimulator::with_config(cfg_jitter);
+        let mut sim_clean = GimbalSimulator::with_config(cfg_clean);
+
+        // Place both at 1 km altitude, looking straight down.
+        for s in [&mut sim_jitter, &mut sim_clean] {
+            s.pos_lat = 0.5_f64; // ~28.6 deg N
+            s.pos_lon = -1.5_f64;
+            s.pos_alt = 1000.0;
+            s.mode = OrionMode::OrionModePosition;
+            s.target_pan = 0.3;
+            s.target_tilt = 0.8; // ~46 deg down
+        }
+
+        // Run several ticks so the look-point converges.
+        for _ in 0..50 {
+            sim_jitter.tick(0.02);
+            sim_clean.tick(0.02);
+        }
+
+        // The jitter-perturbed simulator should have a different look-point.
+        let dlat = (sim_jitter.look_lat - sim_clean.look_lat).abs();
+        let dlon = (sim_jitter.look_lon - sim_clean.look_lon).abs();
+        assert!(
+            dlat > 1e-9 || dlon > 1e-9,
+            "look-point should differ with jitter: dlat={dlat}, dlon={dlon}"
+        );
+
+        // Also verify the jittered fields are populated.
+        assert!(
+            (sim_jitter.pan_jittered - sim_jitter.pan).abs() > 1e-6,
+            "pan_jittered should differ from clean pan"
+        );
+        // Clean sim should have zero jitter offset.
+        assert!(
+            (sim_clean.pan_jittered - sim_clean.pan).abs() < 1e-9,
+            "zero-jitter sim: pan_jittered should equal pan"
+        );
+    }
+
+    // ── Degraded GPS ──────────────────────────────────────────────────────
+
+    #[test]
+    fn degraded_gps_adds_noise_to_position() {
+        let mut sim = GimbalSimulator::default();
+        sim.pos_lat = 0.5;
+        sim.pos_lon = -1.0;
+        sim.pos_alt = 500.0;
+        sim.tick(0.02); // ensure noise_seed is advanced
+
+        sim.faults.inject_degraded_gps(0.001);
+        let telem = sim.to_telemetry();
+
+        // Position should be close to true but not exact.
+        assert!(
+            (telem.pos_lat - 0.5).abs() < 0.01,
+            "degraded GPS: lat should be near true value, got {}",
+            telem.pos_lat
+        );
+        assert!(
+            (telem.pos_lat - 0.5).abs() > 1e-12,
+            "degraded GPS: lat should have noise"
+        );
+        assert!(telem.pos_alt != 0.0, "degraded GPS: alt should not be zero");
+    }
+
+    #[test]
+    fn degraded_gps_does_not_zero_position() {
+        let mut sim = GimbalSimulator::default();
+        sim.pos_lat = 0.5;
+        sim.pos_lon = -1.0;
+        sim.pos_alt = 500.0;
+        sim.faults.inject_degraded_gps(0.0001);
+        let telem = sim.to_telemetry();
+
+        // Unlike gps_loss, positions should NOT be zero.
+        assert!(telem.pos_lat != 0.0);
+        assert!(telem.pos_lon != 0.0);
+        assert!(telem.pos_alt != 0.0);
+    }
+
+    // ── Encoder fault ─────────────────────────────────────────────────────
+
+    #[test]
+    fn encoder_fault_freezes_reported_pan_tilt() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 1.0;
+        sim.target_tilt = 0.5;
+
+        // Move the gimbal partway.
+        for _ in 0..5 {
+            sim.tick(0.02);
+        }
+        let frozen_pan = sim.pan;
+        let frozen_tilt = sim.tilt;
+
+        // Inject encoder fault at current position.
+        sim.faults.inject_encoder_fault(frozen_pan, frozen_tilt);
+
+        // Continue moving internally.
+        for _ in 0..50 {
+            sim.tick(0.02);
+        }
+
+        // Internal state should have moved.
+        assert!(
+            (sim.pan - frozen_pan).abs() > 0.01,
+            "internal pan should have moved: pan={} frozen={}",
+            sim.pan, frozen_pan
+        );
+
+        // Telemetry should still report frozen values.
+        let telem = sim.to_telemetry();
+        assert!(
+            (telem.pan - wrap_angle(frozen_pan)).abs() < 1e-4,
+            "reported pan={} should be frozen at {}",
+            telem.pan, frozen_pan
+        );
+        assert!(
+            (telem.tilt - frozen_tilt).abs() < 1e-4,
+            "reported tilt={} should be frozen at {}",
+            telem.tilt, frozen_tilt
+        );
+    }
+
+    #[test]
+    fn encoder_fault_clear_resumes_reporting() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 1.0;
+        sim.faults.inject_encoder_fault(0.0, 0.0);
+
+        for _ in 0..50 {
+            sim.tick(0.02);
+        }
+
+        sim.faults.clear_encoder_fault();
+        sim.tick(0.02);
+        let telem = sim.to_telemetry();
+
+        // After clearing, reported pan should match actual (jittered) pan.
+        assert!(
+            (telem.pan - wrap_angle(sim.pan_jittered)).abs() < 1e-4,
+            "after clear: reported pan={} should match actual={}",
+            telem.pan, sim.pan_jittered
+        );
+    }
+
+    // ── Thermal throttling ────────────────────────────────────────────────
+
+    #[test]
+    fn thermal_throttle_reduces_slew_rate() {
+        // Two identical simulators: one with thermal warning, one without.
+        let mut sim_normal = GimbalSimulator::default();
+        sim_normal.mode = OrionMode::OrionModePosition;
+        sim_normal.target_pan = 1.0;
+
+        let mut sim_hot = GimbalSimulator::default();
+        sim_hot.mode = OrionMode::OrionModePosition;
+        sim_hot.target_pan = 1.0;
+        sim_hot.faults.inject_thermal();
+
+        // Run both for the same time.
+        for _ in 0..20 {
+            sim_normal.tick(0.02);
+            sim_hot.tick(0.02);
+        }
+
+        // The throttled sim should have moved less.
+        assert!(
+            sim_hot.pan < sim_normal.pan,
+            "thermal throttle: hot pan={} should be less than normal pan={}",
+            sim_hot.pan, sim_normal.pan
+        );
+    }
+
+    #[test]
+    fn thermal_throttle_limits_rate_mode() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeRate;
+        sim.pan_rate_cmd = sim.config.max_slew_rate; // full speed command
+        sim.faults.inject_thermal();
+
+        // Run until rate settles.
+        for _ in 0..200 {
+            sim.tick(0.02);
+        }
+
+        // Rate should be clamped to half of max_slew_rate.
+        let half_max = sim.config.max_slew_rate * 0.5;
+        assert!(
+            (sim.pan_rate - half_max).abs() < 0.01,
+            "thermal throttle rate mode: pan_rate={} should be near half_max={}",
+            sim.pan_rate, half_max
         );
     }
 }

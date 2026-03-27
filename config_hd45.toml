@@ -25,13 +25,24 @@ tilt_min_deg        = -80.0
 tilt_max_deg        = 42.0
 
 [camera]
-# Camera 0: EO wide end (46.8°), Camera 1: EO narrow end (1.2°), Camera 2: LWIR wide (29°)
-# hfov_wide / hfov_narrow drive the zoom interpolation for the active camera.
-# For LWIR (camera 2) the FOV table in config.rs overrides these — see camera_fov().
-hfov_wide_deg   = 46.8
-vfov_wide_deg   = 35.1
-hfov_narrow_deg = 1.2
-vfov_narrow_deg = 0.9
+# Per-camera FOV (wide = zoom 0, narrow = zoom 1).
+# Camera 0: EO (46.8° – 1.2° HFOV, 40× zoom)
+camera_0_hfov_wide_deg   = 46.8
+camera_0_vfov_wide_deg   = 35.1
+camera_0_hfov_narrow_deg = 1.2
+camera_0_vfov_narrow_deg = 0.9
+
+# Camera 1: EO narrow (same sensor, fixed narrow preset)
+camera_1_hfov_wide_deg   = 5.0
+camera_1_vfov_wide_deg   = 3.75
+camera_1_hfov_narrow_deg = 1.2
+camera_1_vfov_narrow_deg = 0.9
+
+# Camera 2: LWIR (29° – 3° HFOV, 10× zoom)
+camera_2_hfov_wide_deg   = 29.0
+camera_2_vfov_wide_deg   = 21.75
+camera_2_hfov_narrow_deg = 3.0
+camera_2_vfov_narrow_deg = 2.25
 
 [vibration]
 # HD45 spec: 1.5° typical total system accuracy — model as moderate jitter.

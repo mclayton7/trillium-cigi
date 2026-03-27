@@ -5,7 +5,9 @@
 //   - build_diagnostics() → OrionDiagnosticsPacket   (voltages, temps, …)
 //   - Periodic console log of diagnostics
 
-use crate::orion::{OrionDiagnosticsPacket, OrionFaultLevel, OrionFaultPacket, OrionFaultType};
+use crate::orion::{
+    OrionDiagnosticsPacket, OrionFaultComponent, OrionFaultLevel, OrionFaultPacket, OrionFaultType,
+};
 
 // ─────────────────────────────────────────── nominal sensor values ──
 
@@ -31,6 +33,18 @@ pub struct FaultState {
     /// Thermal warning (temps elevated).
     pub thermal_warning: bool,
 
+    /// Degraded GPS — adds noise to position fields instead of zeroing them.
+    pub degraded_gps: bool,
+    /// Standard deviation of Gaussian-like noise added when degraded_gps is active.
+    pub gps_noise_std: f64,
+
+    /// Encoder fault — freeze reported pan/tilt at injection-time values.
+    pub encoder_fault: bool,
+    /// Frozen pan angle captured at encoder fault injection (rad).
+    pub frozen_pan: f32,
+    /// Frozen tilt angle captured at encoder fault injection (rad).
+    pub frozen_tilt: f32,
+
     // Internal: accumulated system time (seconds) for temperature drift model.
     pub(crate) uptime_secs: f32,
 }
@@ -54,11 +68,43 @@ impl FaultState {
     pub fn inject_thermal(&mut self)     { self.thermal_warning = true; }
     #[allow(dead_code)]
     pub fn clear_thermal(&mut self)      { self.thermal_warning = false; }
+
+    /// Inject degraded GPS: position fields get Gaussian-like noise instead of
+    /// being zeroed.  `noise_std` controls the standard deviation (radians for
+    /// lat/lon, metres for altitude).
+    pub fn inject_degraded_gps(&mut self, noise_std: f64) {
+        self.degraded_gps = true;
+        self.gps_noise_std = noise_std;
+    }
+    pub fn clear_degraded_gps(&mut self) {
+        self.degraded_gps = false;
+        self.gps_noise_std = 0.0;
+    }
+
+    /// Inject encoder fault: freeze reported pan/tilt at the given angles.
+    /// The simulator control loop continues normally; only telemetry is
+    /// affected.
+    pub fn inject_encoder_fault(&mut self, current_pan: f32, current_tilt: f32) {
+        self.encoder_fault = true;
+        self.frozen_pan = current_pan;
+        self.frozen_tilt = current_tilt;
+    }
+    pub fn clear_encoder_fault(&mut self) {
+        self.encoder_fault = false;
+        self.frozen_pan = 0.0;
+        self.frozen_tilt = 0.0;
+    }
+
     pub fn clear_all(&mut self)          {
         self.gps_loss = false;
         self.motor_fault = false;
         self.imu_dropout = false;
         self.thermal_warning = false;
+        self.degraded_gps = false;
+        self.gps_noise_std = 0.0;
+        self.encoder_fault = false;
+        self.frozen_pan = 0.0;
+        self.frozen_tilt = 0.0;
     }
 
     // ── Packet builders ──────────────────────────────────────────
@@ -106,16 +152,37 @@ impl FaultState {
         }
     }
 
-    /// Build an `OrionFaultPacket` if any active fault warrants one.
-    pub fn build_fault_packet(&self) -> Option<OrionFaultPacket> {
+    /// Build `OrionFaultPacket`s for all active faults.
+    pub fn build_fault_packets(&self) -> Vec<OrionFaultPacket> {
+        let mut pkts = Vec::new();
         if self.motor_fault {
-            return Some(OrionFaultPacket {
+            pkts.push(OrionFaultPacket {
                 type_: OrionFaultType::FaultTypeVelocityLimitExceeded,
                 level: OrionFaultLevel::FaultLevelError,
+                component: OrionFaultComponent::FaultComponentPanAxis,
                 ..Default::default()
             });
         }
-        None
+        if self.gps_loss {
+            // NOTE: The Orion protocol XML defines no GPS-specific fault type.
+            // FaultTypeNone + FaultLevelWarning is a convention for GPS loss.
+            // Update if a GPS fault type is added to OrionPublicProtocol.xml.
+            pkts.push(OrionFaultPacket {
+                type_: OrionFaultType::FaultTypeNone,
+                level: OrionFaultLevel::FaultLevelWarning,
+                component: OrionFaultComponent::FaultComponentPayloadGyros,
+                ..Default::default()
+            });
+        }
+        if self.imu_dropout {
+            pkts.push(OrionFaultPacket {
+                type_: OrionFaultType::FaultTypeInvalidGyroCalibration,
+                level: OrionFaultLevel::FaultLevelError,
+                component: OrionFaultComponent::FaultComponentPayloadGyros,
+                ..Default::default()
+            });
+        }
+        pkts
     }
 
     /// Print a one-line diagnostic summary (called at ~1 Hz).
@@ -222,43 +289,99 @@ mod tests {
     }
 
     #[test]
+    fn inject_and_clear_degraded_gps() {
+        let mut fs = FaultState::default();
+        assert!(!fs.degraded_gps);
+        fs.inject_degraded_gps(0.001);
+        assert!(fs.degraded_gps);
+        assert!((fs.gps_noise_std - 0.001).abs() < 1e-12);
+        fs.clear_degraded_gps();
+        assert!(!fs.degraded_gps);
+        assert_eq!(fs.gps_noise_std, 0.0);
+    }
+
+    #[test]
+    fn inject_and_clear_encoder_fault() {
+        let mut fs = FaultState::default();
+        assert!(!fs.encoder_fault);
+        fs.inject_encoder_fault(0.5, -0.3);
+        assert!(fs.encoder_fault);
+        assert!((fs.frozen_pan - 0.5).abs() < 1e-6);
+        assert!((fs.frozen_tilt - (-0.3)).abs() < 1e-6);
+        fs.clear_encoder_fault();
+        assert!(!fs.encoder_fault);
+        assert_eq!(fs.frozen_pan, 0.0);
+        assert_eq!(fs.frozen_tilt, 0.0);
+    }
+
+    #[test]
     fn clear_all_resets_all_flags() {
         let mut fs = FaultState::default();
         fs.inject_gps_loss();
         fs.inject_motor_fault();
         fs.inject_imu_dropout();
         fs.inject_thermal();
+        fs.inject_degraded_gps(0.01);
+        fs.inject_encoder_fault(1.0, 2.0);
         fs.clear_all();
         assert!(!fs.gps_loss);
         assert!(!fs.motor_fault);
         assert!(!fs.imu_dropout);
         assert!(!fs.thermal_warning);
+        assert!(!fs.degraded_gps);
+        assert_eq!(fs.gps_noise_std, 0.0);
+        assert!(!fs.encoder_fault);
+        assert_eq!(fs.frozen_pan, 0.0);
+        assert_eq!(fs.frozen_tilt, 0.0);
     }
 
-    // ── build_fault_packet ────────────────────────────────────────────────
+    // ── build_fault_packets ───────────────────────────────────────────────
 
     #[test]
-    fn build_fault_packet_none_when_nominal() {
+    fn build_fault_packets_empty_when_nominal() {
         let fs = FaultState::default();
-        assert!(fs.build_fault_packet().is_none());
+        assert!(fs.build_fault_packets().is_empty());
     }
 
     #[test]
-    fn build_fault_packet_motor_fault() {
+    fn build_fault_packets_motor_fault() {
         let mut fs = FaultState::default();
         fs.inject_motor_fault();
-        let pkt = fs.build_fault_packet().expect("expected fault packet");
-        assert!(matches!(pkt.type_, OrionFaultType::FaultTypeVelocityLimitExceeded));
-        assert!(matches!(pkt.level, OrionFaultLevel::FaultLevelError));
+        let pkts = fs.build_fault_packets();
+        assert_eq!(pkts.len(), 1);
+        assert!(matches!(pkts[0].type_, OrionFaultType::FaultTypeVelocityLimitExceeded));
+        assert!(matches!(pkts[0].level, OrionFaultLevel::FaultLevelError));
     }
 
     #[test]
-    fn build_fault_packet_non_motor_returns_none() {
+    fn build_fault_packets_gps_loss() {
         let mut fs = FaultState::default();
         fs.inject_gps_loss();
+        let pkts = fs.build_fault_packets();
+        assert_eq!(pkts.len(), 1);
+        assert!(matches!(pkts[0].type_, OrionFaultType::FaultTypeNone));
+        assert!(matches!(pkts[0].level, OrionFaultLevel::FaultLevelWarning));
+    }
+
+    #[test]
+    fn build_fault_packets_imu_dropout() {
+        let mut fs = FaultState::default();
         fs.inject_imu_dropout();
-        // Only motor_fault produces a packet; GPS/IMU do not
-        assert!(fs.build_fault_packet().is_none());
+        let pkts = fs.build_fault_packets();
+        assert_eq!(pkts.len(), 1);
+        assert!(matches!(pkts[0].type_, OrionFaultType::FaultTypeInvalidGyroCalibration));
+        assert!(matches!(pkts[0].level, OrionFaultLevel::FaultLevelError));
+        assert!(matches!(pkts[0].component, OrionFaultComponent::FaultComponentPayloadGyros));
+    }
+
+    #[test]
+    fn build_fault_packets_multiple_faults() {
+        let mut fs = FaultState::default();
+        fs.inject_motor_fault();
+        fs.inject_gps_loss();
+        fs.inject_imu_dropout();
+        let pkts = fs.build_fault_packets();
+        assert_eq!(pkts.len(), 3, "expected 3 fault packets, got {}", pkts.len());
     }
 
     // ── build_diagnostics ─────────────────────────────────────────────────
