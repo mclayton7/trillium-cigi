@@ -228,6 +228,9 @@ impl GimbalSimulator {
                 // In track mode, gain/level encode the track centroid offset (−0.5 to +0.5).
                 self.track_target = [sc.gain - 0.5, sc.level - 0.5];
                 self.track_active = true;
+                // Seed previous track values so the first tick's derivative is zero.
+                self.prev_track_x = self.track_target[0];
+                self.prev_track_y = self.track_target[1];
             }
             OrionMode::OrionModeGeopoint => {
                 // ac_coupling/noise encode full-Earth lat/lon as 0–1 fractions.
