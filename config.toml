@@ -3,7 +3,6 @@
 # Lines starting with '#' or '[section]' headers are ignored.
 
 [network]
-port = 8008
 orion_listen_port = 8008
 scene_generator_ip = "127.0.0.1"
 scene_generator_cigi_port = 8100
@@ -24,24 +23,80 @@ pan_limit_deg       = 170.0
 tilt_min_deg        = -110.0
 tilt_max_deg        = 30.0
 
+# Cross-axis gyroscopic coupling factor.
+# 0.0 = disabled (axes independent), >0 = coupling proportional to rate product.
+# gyro_coupling_factor = 0.0
+
 [camera]
-# Wide (zoom=0) and narrow (zoom=1) field of view.
+# Wide (zoom=0) and narrow (zoom=1) field of view for camera 0.
+# Zoom uses a logarithmic focal-length curve (exponential FOV interpolation).
 hfov_wide_deg   = 30.0
 vfov_wide_deg   = 22.5
 hfov_narrow_deg = 3.0
 vfov_narrow_deg = 2.25
 
+# Per-camera FOV overrides (uncomment to customise cameras 1 and 2):
+# camera_1_hfov_wide_deg   = 0.5
+# camera_1_vfov_wide_deg   = 0.375
+# camera_1_hfov_narrow_deg = 0.5
+# camera_1_vfov_narrow_deg = 0.375
+# camera_2_hfov_wide_deg   = 20.0
+# camera_2_vfov_wide_deg   = 15.0
+# camera_2_hfov_narrow_deg = 20.0
+# camera_2_vfov_narrow_deg = 15.0
+
 [vibration]
-jitter_freq_hz      = 10.0
+jitter_freq_hz       = 10.0
 jitter_amplitude_deg = 0.05
-noise_floor_deg     = 0.01
+noise_floor_deg      = 0.01
+
+# Second structural resonance (gimbal head mode).
+# jitter_freq_2_hz       = 47.0
+# jitter_amplitude_2_deg = 0.01
+
+[stabilization]
+# 0.0 = perfect inertial stabilization (roll/pitch don't affect LOS).
+# 1.0 = fully body-mounted (full roll/pitch coupling into LOS).
+# stabilization_quality = 0.0
+
+[atmosphere]
+# Atmospheric refraction correction for shallow depression angles (Bennett's formula).
+# refraction_enabled = true
+
+[terrain]
+# Uniform terrain elevation above WGS84 ellipsoid (metres).
+# Raises the ray-intersection surface without needing DEM files.
+# terrain_elevation_m = 0.0
+
+[geopoint]
+# Default target altitude for geopoint mode (metres above ellipsoid).
+# geopoint_alt_m = 0.0
+
+[laser]
+# Maximum effective laser rangefinder range (metres).
+# laser_max_range_m = 20000.0
+
+[tracking]
+# PD controller gains for track mode.
+# track_p_gain = 3.0
+# track_d_gain = 0.5
+
+# Track loss threshold (fractional FOV, 0–1). Target beyond this triggers track loss.
+# track_loss_threshold = 0.45
+
+# Physical size of tracked target (metres). Affects dynamic track size/confidence.
+# track_target_size_m = 2.0
+
+# Angular extent of the tracking gate (degrees). Affects gate_x/y_size in CIGI response.
+# track_gate_size_deg = 1.0
 
 [platform_source]
 # "static" (default): use config values above, never updated.
 # "mavlink": receive real-time position/attitude from a MAVLink autopilot over UDP.
-platform_source      = static
-mavlink_listen_port  = 14550
-mavlink_system_id    = 0
-stanag_listen_port   = 4586
+# "stanag4586": receive position/attitude via STANAG 4586 multicast.
+platform_source        = static
+mavlink_listen_port    = 14550
+mavlink_system_id      = 0
+stanag_listen_port     = 4586
 stanag_multicast_group = "239.0.0.1"
-stanag_vehicle_id    = 0
+stanag_vehicle_id      = 0

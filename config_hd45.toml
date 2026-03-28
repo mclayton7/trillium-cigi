@@ -13,7 +13,7 @@
 # The simulator treats any value >= 360 as unlimited pan.
 
 [network]
-port = 8008
+orion_listen_port = 8008
 
 [kinematics]
 # Slew rate unspecified in HD45 datasheet — placeholder, tune to measured hardware.
@@ -24,8 +24,13 @@ pan_limit_deg       = 360.0
 tilt_min_deg        = -80.0
 tilt_max_deg        = 42.0
 
+# Uncomment to model imperfect gyro compensation at high slew rates.
+# gyro_coupling_factor = 0.02
+
 [camera]
 # Per-camera FOV (wide = zoom 0, narrow = zoom 1).
+# Zoom uses a logarithmic focal-length curve (exponential FOV interpolation).
+
 # Camera 0: EO (46.8° – 1.2° HFOV, 40× zoom)
 camera_0_hfov_wide_deg   = 46.8
 camera_0_vfov_wide_deg   = 35.1
@@ -49,3 +54,27 @@ camera_2_vfov_narrow_deg = 2.25
 jitter_freq_hz       = 10.0
 jitter_amplitude_deg = 0.1
 noise_floor_deg      = 0.05
+
+# Second structural resonance (gimbal head mode).
+jitter_freq_2_hz       = 47.0
+jitter_amplitude_2_deg = 0.02
+
+[stabilization]
+# HD45 has good but not perfect inertial stabilization.
+# Small residual coupling from platform attitude.
+# stabilization_quality = 0.05
+
+[terrain]
+# Set to local terrain elevation for more accurate geolocation.
+# terrain_elevation_m = 0.0
+
+[laser]
+# HD45 laser rangefinder max effective range.
+laser_max_range_m = 20000.0
+
+[tracking]
+# HD45 tracking parameters — tune to match measured hardware.
+# track_p_gain = 3.0
+# track_d_gain = 0.5
+# track_target_size_m = 2.0
+# track_gate_size_deg = 1.0
