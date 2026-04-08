@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use crate::cigi::messages::{
     EntityControl, IgControl, SensorControl, SensorExtendedResponse, StartOfFrame,
 };
-use crate::config::Config;
 
 /// A batch of encoded CIGI packets (IgControl + EntityControl + optional SensorControl)
 /// ready for transmission as a single UDP datagram.
@@ -28,15 +27,17 @@ pub enum CigiResponse {
 /// - `cigi_send_rx`: encoded CIGI datagrams to send to the scene generator.
 /// - `cigi_resp_tx`: parsed responses received from the scene generator.
 pub async fn run(
-    cfg: Config,
+    listen_port: u16,
+    dest_ip: String,
+    dest_port: u16,
     mut cigi_send_rx: mpsc::Receiver<CigiDatagram>,
     cigi_resp_tx: mpsc::Sender<CigiResponse>,
 ) {
-    let bind_addr = format!("0.0.0.0:{}", cfg.cigi_listen_port);
+    let bind_addr = format!("0.0.0.0:{}", listen_port);
     let socket = UdpSocket::bind(&bind_addr)
         .await
         .unwrap_or_else(|e| panic!("[cigi_host] failed to bind {bind_addr}: {e}"));
-    let dest = format!("{}:{}", cfg.scene_generator_ip, cfg.scene_generator_cigi_port);
+    let dest = format!("{}:{}", dest_ip, dest_port);
 
     println!("[cigi_host] UDP on {bind_addr}, sending to {dest}");
 

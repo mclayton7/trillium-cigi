@@ -18,7 +18,6 @@
 //   [34..]    Message Data
 //   [last 4]  Checksum (u32) — wrapping byte sum of all bytes before this field
 
-use crate::config::Config;
 use crate::platform::{PlatformSource, PlatformState};
 use std::net::Ipv4Addr;
 use tokio::sync::watch;
@@ -186,12 +185,8 @@ pub struct Stanag4586Source {
 }
 
 impl Stanag4586Source {
-    pub fn from_config(cfg: &Config) -> Self {
-        Self {
-            port: cfg.stanag_listen_port,
-            multicast_group: cfg.stanag_multicast_group.clone(),
-            vehicle_id_filter: cfg.stanag_vehicle_id,
-        }
+    pub fn new(port: u16, multicast_group: String, vehicle_id_filter: i32) -> Self {
+        Self { port, multicast_group, vehicle_id_filter }
     }
 }
 

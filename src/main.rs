@@ -38,11 +38,11 @@ async fn main() {
     let diag_enabled = args.iter().any(|a| a == "--diag");
 
     // ── Platform state — watch channel seeded from config ────────────────
-    let (platform_tx, platform_rx) = watch::channel(PlatformState::from_config(&cfg));
+    let (platform_tx, platform_rx) = watch::channel(platform::platform_state_from_config(&cfg));
     match cfg.platform_source.as_str() {
-        "mavlink"    => tokio::spawn(MavLinkSource::from_config(&cfg).run(platform_tx)),
-        "stanag4586" => tokio::spawn(Stanag4586Source::from_config(&cfg).run(platform_tx)),
-        _            => tokio::spawn(StaticSource::from_config(&cfg).run(platform_tx)),
+        "mavlink"    => tokio::spawn(MavLinkSource::new(cfg.mavlink_listen_port, cfg.mavlink_system_id).run(platform_tx)),
+        "stanag4586" => tokio::spawn(Stanag4586Source::new(cfg.stanag_listen_port, cfg.stanag_multicast_group.clone(), cfg.stanag_vehicle_id).run(platform_tx)),
+        _            => tokio::spawn(StaticSource::new(platform::platform_state_from_config(&cfg)).run(platform_tx)),
     };
 
     // ── Fallback simulator ────────────────────────────────────────────────
@@ -62,7 +62,7 @@ async fn main() {
     ));
 
     // ── Spawn CIGI host UDP I/O task ──────────────────────────────────────
-    tokio::spawn(cigi::host::run(cfg.clone(), cigi_send_rx, cigi_resp_tx));
+    tokio::spawn(cigi::host::run(cfg.cigi_listen_port, cfg.scene_generator_ip.clone(), cfg.scene_generator_cigi_port, cigi_send_rx, cigi_resp_tx));
 
     // ── Event loop ────────────────────────────────────────────────────────
     let mut tick = tokio::time::interval(Duration::from_secs_f64(DT));

@@ -38,21 +38,6 @@ pub struct PlatformState {
     pub vel_down_m_s: f32,
 }
 
-impl PlatformState {
-    /// Construct from runtime config (static source).
-    pub fn from_config(cfg: &Config) -> Self {
-        Self {
-            lat_rad: cfg.platform_lat,
-            lon_rad: cfg.platform_lon,
-            alt_m: cfg.platform_alt,
-            roll_rad: cfg.platform_roll,
-            pitch_rad: cfg.platform_pitch,
-            yaw_rad: cfg.platform_yaw,
-            ..Self::default()
-        }
-    }
-}
-
 impl Default for PlatformState {
     fn default() -> Self {
         Self {
@@ -76,4 +61,17 @@ impl Default for PlatformState {
 /// creating a new file and implementing `run()`.
 pub trait PlatformSource: Send + 'static {
     async fn run(self, tx: watch::Sender<PlatformState>);
+}
+
+/// Construct a PlatformState from trillium-cigi Config.
+pub fn platform_state_from_config(cfg: &Config) -> PlatformState {
+    PlatformState {
+        lat_rad: cfg.platform_lat,
+        lon_rad: cfg.platform_lon,
+        alt_m: cfg.platform_alt,
+        roll_rad: cfg.platform_roll,
+        pitch_rad: cfg.platform_pitch,
+        yaw_rad: cfg.platform_yaw,
+        ..PlatformState::default()
+    }
 }

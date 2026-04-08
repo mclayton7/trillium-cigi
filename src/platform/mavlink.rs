@@ -7,7 +7,6 @@
 // Frames with bad X.25 CRC are silently dropped.
 // If system_id == 0, all vehicles are accepted; otherwise filtered to that sysid.
 
-use crate::config::Config;
 use crate::platform::{PlatformSource, PlatformState};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -251,11 +250,8 @@ pub struct MavLinkSource {
 }
 
 impl MavLinkSource {
-    pub fn from_config(cfg: &Config) -> Self {
-        Self {
-            port: cfg.mavlink_listen_port,
-            system_id: cfg.mavlink_system_id,
-        }
+    pub fn new(port: u16, system_id: u8) -> Self {
+        Self { port, system_id }
     }
 }
 

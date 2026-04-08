@@ -1,7 +1,6 @@
 // Static platform source — writes the config-derived PlatformState once,
 // then holds the channel open forever. Preserves the pre-MAVLink behavior.
 
-use crate::config::Config;
 use crate::platform::{PlatformSource, PlatformState};
 use tokio::sync::watch;
 
@@ -10,10 +9,8 @@ pub struct StaticSource {
 }
 
 impl StaticSource {
-    pub fn from_config(cfg: &Config) -> Self {
-        Self {
-            state: PlatformState::from_config(cfg),
-        }
+    pub fn new(state: PlatformState) -> Self {
+        Self { state }
     }
 }
 
