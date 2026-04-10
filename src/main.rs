@@ -1,23 +1,23 @@
-mod cigi;
 mod config;
 mod convert;
 mod faults;
-mod geo;
 mod orion;
-mod platform;
 mod simulator;
 mod trillium;
 
 use std::time::{Duration, Instant};
 
 use config::Config;
-use platform::{MavLinkSource, PlatformSource, PlatformState, Stanag4586Source, StaticSource};
 use simulator::GimbalSimulator;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
-use cigi::host::{CigiResponse, build_datagram};
-use convert::to_cigi::{make_ig_control, orion_cmd_to_sensor_control, platform_to_entity_control};
+use sim_core::cigi;
+use sim_core::cigi::build::{
+    build_view_control, build_wire_sensor_control, make_ig_control, platform_to_entity_control,
+};
+use sim_core::cigi::host::{CigiResponse, build_datagram};
+use convert::to_cigi::orion_cmd_to_sensor_control;
 use convert::to_orion::sensor_response_to_telemetry;
 use orion::GeolocateTelemetryCorePacket;
 use orion::OrionCmdPacket;
@@ -26,6 +26,8 @@ use orion::OrionCmdPacket;
 const SG_TIMEOUT: Duration = Duration::from_secs(2);
 /// Platform entity ID used in EntityControl packets.
 const PLATFORM_ENTITY_ID: u16 = 1;
+/// CIGI view identifier for the sensor view.
+const SENSOR_VIEW_ID: u16 = 1;
 /// Tick interval (50 Hz).
 const DT: f64 = 0.02;
 
@@ -38,12 +40,10 @@ async fn main() {
     let diag_enabled = args.iter().any(|a| a == "--diag");
 
     // ── Platform state — watch channel seeded from config ────────────────
-    let (platform_tx, platform_rx) = watch::channel(platform::platform_state_from_config(&cfg));
-    match cfg.platform_source.as_str() {
-        "mavlink"    => tokio::spawn(MavLinkSource::new(cfg.mavlink_listen_port, cfg.mavlink_system_id).run(platform_tx)),
-        "stanag4586" => tokio::spawn(Stanag4586Source::new(cfg.stanag_listen_port, cfg.stanag_multicast_group.clone(), cfg.stanag_vehicle_id).run(platform_tx)),
-        _            => tokio::spawn(StaticSource::new(platform::platform_state_from_config(&cfg)).run(platform_tx)),
-    };
+    let platform_source = cfg.platform_source_config();
+    println!("[main] platform source: {}", platform_source.kind());
+    let (platform_tx, platform_rx) = watch::channel(platform_source.initial_state());
+    platform_source.spawn(platform_tx);
 
     // ── Fallback simulator ────────────────────────────────────────────────
     let mut sim = GimbalSimulator::with_config(cfg.clone());
@@ -97,12 +97,51 @@ async fn main() {
 
                 if sg_connected {
                     // ── Scene generator path ─────────────────────────────
+                    //
+                    // Drive the Rust-side simulator forward in lock-step with
+                    // the scene generator path so `sim.pan`/`sim.tilt` always
+                    // reflect the latest Orion command after slew dynamics.
+                    // These are what we ship in ViewControl.
+                    if let Some(ref cmd) = last_cmd {
+                        let sc_internal = orion_cmd_to_sensor_control(cmd);
+                        sim.apply_sensor_control(&sc_internal);
+                    }
+                    sim.tick(DT);
+
                     let platform = platform_rx.borrow().clone();
                     let ig = make_ig_control(frame_ctr);
                     let ec = platform_to_entity_control(&platform, PLATFORM_ENTITY_ID);
-                    let sc = last_cmd.as_ref().map(orion_cmd_to_sensor_control);
-                    let datagram = build_datagram(&ig, &ec, sc.as_ref());
+                    // ViewControl: authoritative gimbal pose + mount offsets.
+                    // Uses the simulator's current (slewed) pan/tilt so the IG
+                    // renders exactly what the Rust side believes.
+                    let vc = build_view_control(
+                        sim.pan,
+                        sim.tilt,
+                        &cfg.gimbal_mount,
+                        SENSOR_VIEW_ID,
+                        PLATFORM_ENTITY_ID,
+                    );
+                    // SensorControl on the wire: only camera selection + FOV
+                    // preset (via Gain). Zoom command plumbing from Orion is
+                    // future work — always send preset 0 (widest) for now.
+                    // The scene generator reads Gain as preset index; sending
+                    // a pan-derived value (old behavior) caused wild FOV jumps.
+                    let sc_wire = build_wire_sensor_control(
+                        sim.camera_index.max(0) as u8,
+                        SENSOR_VIEW_ID as u8,
+                        0,
+                        3,
+                    );
+                    let datagram = build_datagram(&ig, &ec, Some(&vc), Some(&sc_wire));
                     cigi_send_tx.try_send(datagram).ok();
+
+                    // Emit synthetic telemetry so the Orion Controller keeps
+                    // seeing fresh look-point data while the IG path is up.
+                    if frame_ctr % 5 == 0 {
+                        let ser = sim.to_sensor_extended_response();
+                        let telem = sensor_response_to_telemetry(&ser, &platform);
+                        orion_telem_tx.try_send(telem).ok();
+                    }
                 } else {
                     // ── Simulator fallback ───────────────────────────────
                     if let Some(ref cmd) = last_cmd {

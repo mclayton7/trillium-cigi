@@ -1,8 +1,8 @@
 // Convert CIGI responses → Orion telemetry packets sent back to the Trillium controller.
 
-use crate::cigi::messages::SensorExtendedResponse;
+use sim_core::cigi::messages::SensorExtendedResponse;
 use crate::orion::{GeolocateTelemetryCorePacket, OrionMode};
-use crate::platform::PlatformState;
+use sim_core::platform::PlatformState;
 
 /// Map a CIGI `SensorExtendedResponse` (received from the scene generator) plus
 /// the current `PlatformState` into an Orion `GeolocateTelemetryCorePacket`
@@ -39,8 +39,8 @@ pub fn sensor_response_to_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cigi::messages::SensorExtendedResponse;
-    use crate::platform::PlatformState;
+    use sim_core::cigi::messages::SensorExtendedResponse;
+    use sim_core::platform::PlatformState;
 
     #[test]
     fn sensor_response_to_telemetry_basic() {

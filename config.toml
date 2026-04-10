@@ -36,6 +36,18 @@ jitter_freq_hz      = 10.0
 jitter_amplitude_deg = 0.05
 noise_floor_deg     = 0.01
 
+[gimbal_mount]
+# Physical installation of the gimbal on the airframe.
+# Translation: offset from airframe CG to gimbal base, body frame (fwd/right/down), metres.
+# Rotation: fixed boresight rotation of gimbal base relative to body frame (roll/pitch/yaw), degrees.
+# Default (all zeros): gimbal at CG, boresight along airframe nose.
+gimbal_mount_fwd_m    = 0.0
+gimbal_mount_right_m  = 0.0
+gimbal_mount_down_m   = 0.0
+gimbal_mount_roll_deg  = 0.0
+gimbal_mount_pitch_deg = 0.0
+gimbal_mount_yaw_deg   = 0.0
+
 [platform_source]
 # "static" (default): use config values above, never updated.
 # "mavlink": receive real-time position/attitude from a MAVLink autopilot over UDP.

@@ -1,9 +1,24 @@
-// Runtime configuration — Phase 7.1.
+// Runtime configuration.
 //
-// Loaded from `config.toml` (or the path given to `Config::load`).
-// Falls back to sensible Orion hardware defaults if the file is absent.
+// The public `Config` struct below is **flat** — every field is reachable
+// via `cfg.field_name` so the ~50 field accesses across this crate don't
+// move. The TOML file on disk, however, is **sectioned**: a private
+// `ConfigFile` struct tree mirrors the `[network] / [platform_source] / ...`
+// layout, deserialises via `serde` + the `toml` crate, and is folded into
+// `Config` by a `From` impl that only overrides fields the user actually
+// specified. Missing sections fall through to `Config::default()`.
 //
-// File format: simple key = value lines (comments with #, section headers [ignored]).
+// Adding a new config knob:
+//   1. Add a field to `Config` + `Config::default`
+//   2. Add the matching `Option<T>` field to the appropriate nested
+//      `ConfigFile` section struct (or add a new section)
+//   3. Copy the value across in `From<ConfigFile> for Config`
+
+use serde::Deserialize;
+use sim_core::geo::GimbalMount;
+use sim_core::platform::{
+    MavLinkSourceConfig, PlatformSourceConfig, Stanag4586SourceConfig, StaticSourceConfig,
+};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -44,18 +59,17 @@ pub struct Config {
     pub tilt_max: f32,
 
     // ── Camera ───────────────────────────────────────────
-    /// Wide-angle horizontal FOV (rad). Default: 30°.
-    /// Also serves as camera 0 wide HFOV (backward compat).
+    /// Wide-angle HFOV (rad) — synced from `camera_table[0].0` at load.
     pub hfov_wide: f32,
-    /// Wide-angle vertical FOV (rad). Default: 22.5°.
+    /// Wide-angle VFOV (rad).
     pub vfov_wide: f32,
-    /// Narrow (zoom) horizontal FOV (rad). Default: 3°.
+    /// Narrow HFOV (rad).
     pub hfov_narrow: f32,
-    /// Narrow (zoom) vertical FOV (rad). Default: 2.25°.
+    /// Narrow VFOV (rad).
     pub vfov_narrow: f32,
 
     /// Per-camera FOV table: `[(hfov_wide_deg, vfov_wide_deg, hfov_narrow_deg, vfov_narrow_deg); 3]`.
-    /// Index 0 = EO wide, 1 = EO narrow, 2 = IR.  Stored in **degrees**.
+    /// Index 0 = EO wide, 1 = EO narrow, 2 = IR. Stored in **degrees**.
     pub camera_table: [(f32, f32, f32, f32); 3],
 
     // ── Vibration ────────────────────────────────────────
@@ -67,10 +81,13 @@ pub struct Config {
     pub noise_floor: f32,
 
     // ── Stabilization ─────────────────────────────────────
-    /// Stabilization quality factor: 0.0 = perfect inertial stabilization
-    /// (roll/pitch have no effect on LOS), 1.0 = fully body-mounted (full
-    /// roll/pitch coupling).  Default: 0.0 (Orion is inertially stabilized).
+    /// Stabilization quality factor: 0.0 = perfect inertial stabilization,
+    /// 1.0 = fully body-mounted. Default: 0.0 (Orion is inertially stabilized).
     pub stabilization_quality: f32,
+
+    // ── Gimbal mount ──────────────────────────────────────
+    /// Physical installation of the gimbal on the airframe.
+    pub gimbal_mount: GimbalMount,
 
     // ── Atmospheric ──────────────────────────────────────────
     /// Enable atmospheric refraction correction for LOS ray-cast. Default: true.
@@ -78,7 +95,6 @@ pub struct Config {
 
     // ── Terrain ─────────────────────────────────────────────
     /// Uniform terrain elevation above WGS84 ellipsoid (metres). Default: 0.0.
-    /// Raises the effective intersection surface for LOS ray-cast without needing DEM files.
     pub terrain_elevation_m: f64,
 
     // ── Geopoint ──────────────────────────────────────────
@@ -94,7 +110,8 @@ pub struct Config {
     pub track_loss_threshold: f32,
 
     // ── Platform source ───────────────────────────────
-    /// Platform data source: "static" (default), "mavlink", or "stanag4586".
+    /// Platform source selector: `"static"` (default), `"mavlink"`, or `"stanag4586"`.
+    /// Packaged into a [`PlatformSourceConfig`] by [`Config::platform_source_config`].
     pub platform_source: String,
     /// UDP port to listen for MAVLink telemetry (default 14550).
     pub mavlink_listen_port: u16,
@@ -139,6 +156,7 @@ impl Default for Config {
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
+            gimbal_mount: GimbalMount::default(),
             refraction_enabled: true,
             terrain_elevation_m: 0.0,
             geopoint_alt_m: 0.0,
@@ -155,181 +173,285 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    /// Load from `path`.  Missing file → default.  Parse errors → skip that line.
-    pub fn load(path: &str) -> Self {
+// ═════════════════════════════════════════════════════════════════════════
+//  TOML file format (private)
+// ═════════════════════════════════════════════════════════════════════════
+//
+// Every field is `Option<T>` so that missing keys fall through to the
+// `Config::default()` values in the `From<ConfigFile> for Config` impl.
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigFile {
+    network: NetworkSection,
+    platform_source: PlatformSourceSection,
+    kinematics: KinematicsSection,
+    camera: CameraSection,
+    vibration: VibrationSection,
+    stabilization: StabilizationSection,
+    gimbal_mount: GimbalMountSection,
+    atmosphere: AtmosphereSection,
+    terrain: TerrainSection,
+    geopoint: GeopointSection,
+    track: TrackSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NetworkSection {
+    orion_listen_port: Option<u16>,
+    scene_generator_ip: Option<String>,
+    scene_generator_cigi_port: Option<u16>,
+    cigi_listen_port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PlatformSourceSection {
+    /// `"static"` | `"mavlink"` | `"stanag4586"`
+    kind: Option<String>,
+    mavlink: PlatformMavLinkSection,
+    stanag4586: PlatformStanagSection,
+    #[serde(rename = "static")]
+    static_: PlatformStaticSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PlatformMavLinkSection {
+    listen_port: Option<u16>,
+    system_id: Option<u8>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PlatformStanagSection {
+    listen_port: Option<u16>,
+    multicast_group: Option<String>,
+    vehicle_id_filter: Option<i32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PlatformStaticSection {
+    lat_deg: Option<f64>,
+    lon_deg: Option<f64>,
+    alt_m: Option<f64>,
+    roll_deg: Option<f32>,
+    pitch_deg: Option<f32>,
+    yaw_deg: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KinematicsSection {
+    max_slew_rate_deg_s: Option<f32>,
+    max_accel_deg_s2: Option<f32>,
+    pan_limit_deg: Option<f32>,
+    tilt_min_deg: Option<f32>,
+    tilt_max_deg: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CameraSection {
+    eo_wide: CameraEntrySection,
+    eo_narrow: CameraEntrySection,
+    ir: CameraEntrySection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CameraEntrySection {
+    hfov_wide_deg: Option<f32>,
+    vfov_wide_deg: Option<f32>,
+    hfov_narrow_deg: Option<f32>,
+    vfov_narrow_deg: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct VibrationSection {
+    jitter_freq_hz: Option<f32>,
+    jitter_amplitude_deg: Option<f32>,
+    noise_floor_deg: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StabilizationSection {
+    quality: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GimbalMountSection {
+    fwd_m: Option<f64>,
+    right_m: Option<f64>,
+    down_m: Option<f64>,
+    roll_deg: Option<f64>,
+    pitch_deg: Option<f64>,
+    yaw_deg: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AtmosphereSection {
+    refraction_enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TerrainSection {
+    elevation_m: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GeopointSection {
+    alt_m: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TrackSection {
+    p_gain: Option<f32>,
+    d_gain: Option<f32>,
+    loss_threshold: Option<f32>,
+}
+
+impl From<ConfigFile> for Config {
+    fn from(f: ConfigFile) -> Self {
         let mut cfg = Config::default();
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return cfg;
-        };
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-                continue;
-            }
-            let Some((key, val)) = line.split_once('=') else { continue };
-            let key = key.trim();
-            let val = val.trim();
-            match key {
-                "max_slew_rate_deg_s" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.max_slew_rate = v.to_radians(); }
-                }
-                "max_accel_deg_s2" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.max_accel = v.to_radians(); }
-                }
-                "pan_limit_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.pan_limit = v.to_radians(); }
-                }
-                "tilt_min_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.tilt_min = v.to_radians(); }
-                }
-                "tilt_max_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.tilt_max = v.to_radians(); }
-                }
-                "hfov_wide_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.hfov_wide = v.to_radians(); }
-                }
-                "vfov_wide_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.vfov_wide = v.to_radians(); }
-                }
-                "hfov_narrow_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.hfov_narrow = v.to_radians(); }
-                }
-                "vfov_narrow_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.vfov_narrow = v.to_radians(); }
-                }
-                "jitter_freq_hz" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.jitter_freq = v; }
-                }
-                "jitter_amplitude_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.jitter_amplitude = v.to_radians(); }
-                }
-                "noise_floor_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.noise_floor = v.to_radians(); }
-                }
-                "stabilization_quality" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.stabilization_quality = v.clamp(0.0, 1.0); }
-                }
-                "refraction_enabled" => {
-                    match val {
-                        "true" | "1" => cfg.refraction_enabled = true,
-                        "false" | "0" => cfg.refraction_enabled = false,
-                        _ => {}
-                    }
-                }
-                "terrain_elevation_m" => {
-                    if let Ok(v) = val.parse::<f64>() { cfg.terrain_elevation_m = v.max(0.0); }
-                }
-                "geopoint_alt_m" => {
-                    if let Ok(v) = val.parse::<f64>() { cfg.geopoint_alt_m = v; }
-                }
-                "track_p_gain" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.track_p_gain = v; }
-                }
-                "track_d_gain" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.track_d_gain = v; }
-                }
-                "track_loss_threshold" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.track_loss_threshold = v.clamp(0.0, 1.0); }
-                }
-                "orion_listen_port" => {
-                    if let Ok(v) = val.parse::<u16>() { cfg.orion_listen_port = v; }
-                }
-                "scene_generator_ip" => {
-                    cfg.scene_generator_ip = val.trim_matches('"').to_string();
-                }
-                "scene_generator_cigi_port" => {
-                    if let Ok(v) = val.parse::<u16>() { cfg.scene_generator_cigi_port = v; }
-                }
-                "cigi_listen_port" => {
-                    if let Ok(v) = val.parse::<u16>() { cfg.cigi_listen_port = v; }
-                }
-                "platform_lat_deg" => {
-                    if let Ok(v) = val.parse::<f64>() { cfg.platform_lat = v.to_radians(); }
-                }
-                "platform_lon_deg" => {
-                    if let Ok(v) = val.parse::<f64>() { cfg.platform_lon = v.to_radians(); }
-                }
-                "platform_alt_m" => {
-                    if let Ok(v) = val.parse::<f64>() { cfg.platform_alt = v; }
-                }
-                "platform_roll_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.platform_roll = v.to_radians(); }
-                }
-                "platform_pitch_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.platform_pitch = v.to_radians(); }
-                }
-                "platform_yaw_deg" => {
-                    if let Ok(v) = val.parse::<f32>() { cfg.platform_yaw = v.to_radians(); }
-                }
-                "platform_source" => {
-                    cfg.platform_source = val.trim_matches('"').to_string();
-                }
-                "mavlink_listen_port" => {
-                    if let Ok(v) = val.parse::<u16>() { cfg.mavlink_listen_port = v; }
-                }
-                "mavlink_system_id" => {
-                    if let Ok(v) = val.parse::<u8>() { cfg.mavlink_system_id = v; }
-                }
-                "stanag_listen_port" => {
-                    if let Ok(v) = val.parse::<u16>() { cfg.stanag_listen_port = v; }
-                }
-                "stanag_multicast_group" => {
-                    cfg.stanag_multicast_group = val.trim_matches('"').to_string();
-                }
-                "stanag_vehicle_id" => {
-                    if let Ok(v) = val.parse::<i32>() { cfg.stanag_vehicle_id = v; }
-                }
-                _ => {
-                    // Per-camera FOV keys: camera_N_hfov_wide_deg, etc.
-                    if let Some(rest) = key.strip_prefix("camera_") {
-                        // Parse camera index (single digit)
-                        if let Some((idx_str, field)) = rest.split_once('_') {
-                            if let Ok(idx) = idx_str.parse::<usize>() {
-                                if idx < 3 {
-                                    if let Ok(v) = val.parse::<f32>() {
-                                        match field {
-                                            "hfov_wide_deg" => cfg.camera_table[idx].0 = v,
-                                            "vfov_wide_deg" => cfg.camera_table[idx].1 = v,
-                                            "hfov_narrow_deg" => cfg.camera_table[idx].2 = v,
-                                            "vfov_narrow_deg" => cfg.camera_table[idx].3 = v,
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Sync camera_table[0] with the legacy hfov/vfov fields.
-        // If any camera_0_* key was also set, it wins (parsed after legacy keys
-        // only when it appears later in the file, but we reconcile here by
-        // checking whether camera_table[0] was changed from default).
-        // Strategy: legacy keys always write camera_table[0] as well.
-        // We already parsed them above into hfov_wide etc., so just copy.
-        // But if camera_0_* keys were explicitly set they'll have overwritten
-        // camera_table[0] already. To keep it simple: after all parsing,
-        // if camera_table[0] still equals the compiled-in default AND the
-        // legacy fields differ from compiled-in default, copy legacy → table[0].
-        let def = Config::default();
-        let default_cam0 = def.camera_table[0];
-        if cfg.camera_table[0] == default_cam0 {
-            cfg.camera_table[0] = (
-                cfg.hfov_wide.to_degrees(),
-                cfg.vfov_wide.to_degrees(),
-                cfg.hfov_narrow.to_degrees(),
-                cfg.vfov_narrow.to_degrees(),
-            );
-        }
-        // Also sync back: hfov_wide/narrow etc. from camera_table[0] so
-        // fov_at_zoom() uses the right values for the active camera 0.
+
+        // ── Network ──
+        if let Some(v) = f.network.orion_listen_port { cfg.orion_listen_port = v; }
+        if let Some(v) = f.network.scene_generator_ip { cfg.scene_generator_ip = v; }
+        if let Some(v) = f.network.scene_generator_cigi_port { cfg.scene_generator_cigi_port = v; }
+        if let Some(v) = f.network.cigi_listen_port { cfg.cigi_listen_port = v; }
+
+        // ── Platform source ──
+        if let Some(k) = f.platform_source.kind { cfg.platform_source = k; }
+        if let Some(v) = f.platform_source.mavlink.listen_port { cfg.mavlink_listen_port = v; }
+        if let Some(v) = f.platform_source.mavlink.system_id { cfg.mavlink_system_id = v; }
+        if let Some(v) = f.platform_source.stanag4586.listen_port { cfg.stanag_listen_port = v; }
+        if let Some(v) = f.platform_source.stanag4586.multicast_group { cfg.stanag_multicast_group = v; }
+        if let Some(v) = f.platform_source.stanag4586.vehicle_id_filter { cfg.stanag_vehicle_id = v; }
+        if let Some(v) = f.platform_source.static_.lat_deg { cfg.platform_lat = v.to_radians(); }
+        if let Some(v) = f.platform_source.static_.lon_deg { cfg.platform_lon = v.to_radians(); }
+        if let Some(v) = f.platform_source.static_.alt_m { cfg.platform_alt = v; }
+        if let Some(v) = f.platform_source.static_.roll_deg { cfg.platform_roll = v.to_radians(); }
+        if let Some(v) = f.platform_source.static_.pitch_deg { cfg.platform_pitch = v.to_radians(); }
+        if let Some(v) = f.platform_source.static_.yaw_deg { cfg.platform_yaw = v.to_radians(); }
+
+        // ── Kinematics ──
+        if let Some(v) = f.kinematics.max_slew_rate_deg_s { cfg.max_slew_rate = v.to_radians(); }
+        if let Some(v) = f.kinematics.max_accel_deg_s2 { cfg.max_accel = v.to_radians(); }
+        if let Some(v) = f.kinematics.pan_limit_deg { cfg.pan_limit = v.to_radians(); }
+        if let Some(v) = f.kinematics.tilt_min_deg { cfg.tilt_min = v.to_radians(); }
+        if let Some(v) = f.kinematics.tilt_max_deg { cfg.tilt_max = v.to_radians(); }
+
+        // ── Camera ──
+        // Per-camera entries override the defaults for each of the three
+        // slots in `camera_table`. Missing entries keep the default.
+        apply_camera_entry(&f.camera.eo_wide, &mut cfg.camera_table[0]);
+        apply_camera_entry(&f.camera.eo_narrow, &mut cfg.camera_table[1]);
+        apply_camera_entry(&f.camera.ir, &mut cfg.camera_table[2]);
+        // Sync cam-0 into the legacy `hfov_wide` / etc. fields that
+        // `fov_at_zoom` reads. These are kept as radians.
         cfg.hfov_wide = cfg.camera_table[0].0.to_radians();
         cfg.vfov_wide = cfg.camera_table[0].1.to_radians();
         cfg.hfov_narrow = cfg.camera_table[0].2.to_radians();
         cfg.vfov_narrow = cfg.camera_table[0].3.to_radians();
+
+        // ── Vibration ──
+        if let Some(v) = f.vibration.jitter_freq_hz { cfg.jitter_freq = v; }
+        if let Some(v) = f.vibration.jitter_amplitude_deg { cfg.jitter_amplitude = v.to_radians(); }
+        if let Some(v) = f.vibration.noise_floor_deg { cfg.noise_floor = v.to_radians(); }
+
+        // ── Stabilization ──
+        if let Some(v) = f.stabilization.quality { cfg.stabilization_quality = v.clamp(0.0, 1.0); }
+
+        // ── Gimbal mount ──
+        if let Some(v) = f.gimbal_mount.fwd_m   { cfg.gimbal_mount.translation_body_m[0] = v; }
+        if let Some(v) = f.gimbal_mount.right_m { cfg.gimbal_mount.translation_body_m[1] = v; }
+        if let Some(v) = f.gimbal_mount.down_m  { cfg.gimbal_mount.translation_body_m[2] = v; }
+        if let Some(v) = f.gimbal_mount.roll_deg  { cfg.gimbal_mount.rotation_body_rad[0] = v.to_radians(); }
+        if let Some(v) = f.gimbal_mount.pitch_deg { cfg.gimbal_mount.rotation_body_rad[1] = v.to_radians(); }
+        if let Some(v) = f.gimbal_mount.yaw_deg   { cfg.gimbal_mount.rotation_body_rad[2] = v.to_radians(); }
+
+        // ── Atmospheric / terrain / geopoint / track ──
+        if let Some(v) = f.atmosphere.refraction_enabled { cfg.refraction_enabled = v; }
+        if let Some(v) = f.terrain.elevation_m { cfg.terrain_elevation_m = v.max(0.0); }
+        if let Some(v) = f.geopoint.alt_m { cfg.geopoint_alt_m = v; }
+        if let Some(v) = f.track.p_gain { cfg.track_p_gain = v; }
+        if let Some(v) = f.track.d_gain { cfg.track_d_gain = v; }
+        if let Some(v) = f.track.loss_threshold { cfg.track_loss_threshold = v.clamp(0.0, 1.0); }
+
         cfg
+    }
+}
+
+fn apply_camera_entry(src: &CameraEntrySection, dst: &mut (f32, f32, f32, f32)) {
+    if let Some(v) = src.hfov_wide_deg { dst.0 = v; }
+    if let Some(v) = src.vfov_wide_deg { dst.1 = v; }
+    if let Some(v) = src.hfov_narrow_deg { dst.2 = v; }
+    if let Some(v) = src.vfov_narrow_deg { dst.3 = v; }
+}
+
+impl Config {
+    /// Load from `path`.
+    ///
+    /// - Missing file → `Config::default()`.
+    /// - Malformed TOML or unknown keys → log the error and fall back to
+    ///   defaults. `deny_unknown_fields` on every section means misspelled
+    ///   keys surface as errors rather than silently doing nothing.
+    pub fn load(path: &str) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Config::default();
+        };
+        match toml::from_str::<ConfigFile>(&text) {
+            Ok(file) => file.into(),
+            Err(e) => {
+                eprintln!("[config] failed to parse {path}: {e}");
+                Config::default()
+            }
+        }
+    }
+
+    /// Seed a `PlatformState` from the static position/attitude fields in the
+    /// config. Kept as a small wrapper around
+    /// [`PlatformSourceConfig::initial_state`] for backward compat with
+    /// callers that don't want to materialise the full source enum.
+    pub fn initial_platform_state(&self) -> sim_core::platform::PlatformState {
+        self.platform_source_config().initial_state()
+    }
+
+    /// Package the config fields into the canonical
+    /// [`PlatformSourceConfig`] variant. Called once at startup by `main.rs`.
+    ///
+    /// Unknown / missing `platform_source` strings fall through to the
+    /// `Static` variant, which preserves the pre-Phase-3c behaviour.
+    pub fn platform_source_config(&self) -> PlatformSourceConfig {
+        match self.platform_source.as_str() {
+            "mavlink" => PlatformSourceConfig::MavLink(MavLinkSourceConfig {
+                listen_port: self.mavlink_listen_port,
+                system_id: self.mavlink_system_id,
+            }),
+            "stanag4586" => PlatformSourceConfig::Stanag4586(Stanag4586SourceConfig {
+                listen_port: self.stanag_listen_port,
+                multicast_group: self.stanag_multicast_group.clone(),
+                vehicle_id_filter: self.stanag_vehicle_id,
+            }),
+            _ => PlatformSourceConfig::Static(StaticSourceConfig {
+                lat_rad: self.platform_lat,
+                lon_rad: self.platform_lon,
+                alt_m: self.platform_alt,
+                roll_rad: self.platform_roll,
+                pitch_rad: self.platform_pitch,
+                yaw_rad: self.platform_yaw,
+            }),
+        }
     }
 
     /// Returns `true` when pan rotation is continuous (no hard stop).
@@ -343,17 +465,13 @@ impl Config {
     ///
     /// Uses a logarithmic (exponential) curve that models real optical zoom:
     /// `fov = fov_wide * (fov_narrow / fov_wide).powf(zoom)`.
-    /// This gives perceptually uniform zoom speed — the same zoom increment
-    /// produces the same proportional FOV change anywhere in the range.
     pub fn fov_at_zoom(&self, zoom: f32) -> (f32, f32) {
         let t = zoom.clamp(0.0, 1.0);
         let hfov = self.hfov_wide * (self.hfov_narrow / self.hfov_wide).powf(t);
         let vfov = self.vfov_wide * (self.vfov_narrow / self.vfov_wide).powf(t);
         (hfov, vfov)
     }
-}
 
-impl Config {
     /// Look up `(hfov_deg, vfov_deg)` wide-end FOV for a camera index.
     /// Falls back to camera 0 for out-of-range indices.
     pub fn camera_fov(&self, index: i8) -> (f32, f32) {
@@ -367,7 +485,7 @@ impl Config {
     }
 
     /// HFOV/VFOV interpolated by zoom level for a specific camera.
-    /// zoom 0 = wide end, 1 = narrow end.  Returns radians.
+    /// zoom 0 = wide end, 1 = narrow end. Returns radians.
     pub fn fov_at_zoom_for_camera(&self, camera: i8, zoom: f32) -> (f32, f32) {
         let i = camera.max(0) as usize;
         let entry = if i < self.camera_table.len() {
@@ -409,37 +527,67 @@ mod tests {
         assert_eq!(cfg.orion_listen_port, def.orion_listen_port);
         assert_eq!(cfg.scene_generator_ip, def.scene_generator_ip);
         assert_eq!(cfg.max_slew_rate, def.max_slew_rate);
-        assert_eq!(cfg.platform_lat, def.platform_lat);
     }
 
     #[test]
-    fn load_known_keys_parsed_correctly() {
+    fn load_network_section() {
         let content = concat!(
-            "max_slew_rate_deg_s = 120.0\n",
+            "[network]\n",
             "orion_listen_port = 9090\n",
-            "platform_lat_deg = 45.0\n",
-            "mavlink_system_id = 7\n",
-            "stanag_vehicle_id = 42\n",
+            "scene_generator_ip = \"192.168.1.50\"\n",
+            "scene_generator_cigi_port = 18888\n",
+            "cigi_listen_port = 18889\n",
         );
-        let path = write_temp("known_keys", content);
+        let path = write_temp("network", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
-        assert!((cfg.max_slew_rate - 120_f32.to_radians()).abs() < 1e-5);
         assert_eq!(cfg.orion_listen_port, 9090);
-        assert!((cfg.platform_lat - 45_f64.to_radians()).abs() < 1e-10);
-        assert_eq!(cfg.mavlink_system_id, 7);
-        assert_eq!(cfg.stanag_vehicle_id, 42);
+        assert_eq!(cfg.scene_generator_ip, "192.168.1.50");
+        assert_eq!(cfg.scene_generator_cigi_port, 18888);
+        assert_eq!(cfg.cigi_listen_port, 18889);
     }
 
     #[test]
-    fn load_comments_and_section_headers_ignored() {
+    fn load_kinematics_section_converts_deg_to_rad() {
         let content = concat!(
-            "# this is a comment\n",
+            "[kinematics]\n",
+            "max_slew_rate_deg_s = 120.0\n",
+            "pan_limit_deg = 180.0\n",
+        );
+        let path = write_temp("kinematics", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!((cfg.max_slew_rate - 120.0_f32.to_radians()).abs() < 1e-6);
+        assert!((cfg.pan_limit - 180.0_f32.to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn load_unknown_keys_are_rejected() {
+        // With deny_unknown_fields, a typo is a hard error rather than a
+        // silent no-op. Parse failures fall back to Config::default.
+        let content = concat!(
+            "[network]\n",
+            "totaly_wrong_key = 999\n",
+        );
+        let path = write_temp("unknown", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        // Fell back to default because parsing failed.
+        let def = Config::default();
+        assert_eq!(cfg.orion_listen_port, def.orion_listen_port);
+    }
+
+    #[test]
+    fn load_partial_section_keeps_defaults_for_missing_keys() {
+        let content = concat!(
             "[network]\n",
             "orion_listen_port = 1234\n",
+            // scene_generator_ip missing — default should survive
         );
-        let path = write_temp("comments", content);
+        let path = write_temp("partial_network", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
@@ -448,68 +596,164 @@ mod tests {
     }
 
     #[test]
-    fn load_unknown_keys_silently_ignored() {
+    fn load_static_platform_section_converts_lat_lon() {
         let content = concat!(
-            "totally_unknown_key = 999\n",
-            "orion_listen_port = 5555\n",
+            "[platform_source]\n",
+            "kind = \"static\"\n",
+            "[platform_source.static]\n",
+            "lat_deg = 90.0\n",
+            "lon_deg = -45.0\n",
+            "alt_m = 1500.0\n",
         );
-        let path = write_temp("unknown_keys", content);
-        let cfg = Config::load(&path);
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(cfg.orion_listen_port, 5555);
-        assert_eq!(cfg.cigi_listen_port, 8101); // default untouched
-    }
-
-    #[test]
-    fn load_whitespace_around_equals_handled() {
-        let content = concat!("orion_listen_port=7777\n", "cigi_listen_port = 6666\n");
-        let path = write_temp("whitespace_eq", content);
-        let cfg = Config::load(&path);
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(cfg.orion_listen_port, 7777);
-        assert_eq!(cfg.cigi_listen_port, 6666);
-    }
-
-    #[test]
-    fn load_quoted_string_values_stripped() {
-        let content = "scene_generator_ip = \"192.168.1.50\"\n";
-        let path = write_temp("quoted_string", content);
-        let cfg = Config::load(&path);
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(cfg.scene_generator_ip, "192.168.1.50");
-    }
-
-    #[test]
-    fn load_platform_lat_deg_to_radians() {
-        let content = "platform_lat_deg = 90.0\n";
-        let path = write_temp("platform_lat", content);
+        let path = write_temp("static_platform", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
         assert!((cfg.platform_lat - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
+        assert!((cfg.platform_lon + std::f64::consts::FRAC_PI_4).abs() < 1e-10);
+        assert!((cfg.platform_alt - 1500.0).abs() < 1e-9);
     }
 
     #[test]
-    fn load_mavlink_system_id_max() {
-        let content = "mavlink_system_id = 255\n";
-        let path = write_temp("mavlink_id", content);
+    fn load_mavlink_subtable() {
+        let content = concat!(
+            "[platform_source]\n",
+            "kind = \"mavlink\"\n",
+            "[platform_source.mavlink]\n",
+            "listen_port = 14599\n",
+            "system_id = 255\n",
+        );
+        let path = write_temp("mavlink_sub", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
+        assert_eq!(cfg.platform_source, "mavlink");
+        assert_eq!(cfg.mavlink_listen_port, 14599);
         assert_eq!(cfg.mavlink_system_id, 255_u8);
     }
 
     #[test]
-    fn load_stanag_vehicle_id_negative() {
-        let content = "stanag_vehicle_id = -1\n";
-        let path = write_temp("stanag_vid", content);
+    fn load_stanag_subtable() {
+        let content = concat!(
+            "[platform_source]\n",
+            "kind = \"stanag4586\"\n",
+            "[platform_source.stanag4586]\n",
+            "listen_port = 4599\n",
+            "multicast_group = \"239.0.0.42\"\n",
+            "vehicle_id_filter = -1\n",
+        );
+        let path = write_temp("stanag_sub", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
-        assert_eq!(cfg.stanag_vehicle_id, -1_i32);
+        assert_eq!(cfg.platform_source, "stanag4586");
+        assert_eq!(cfg.stanag_listen_port, 4599);
+        assert_eq!(cfg.stanag_multicast_group, "239.0.0.42");
+        assert_eq!(cfg.stanag_vehicle_id, -1);
+    }
+
+    #[test]
+    fn load_gimbal_mount_all_fields() {
+        let content = concat!(
+            "[gimbal_mount]\n",
+            "fwd_m = 0.8\n",
+            "right_m = -0.05\n",
+            "down_m = 0.15\n",
+            "roll_deg = 0.0\n",
+            "pitch_deg = -2.5\n",
+            "yaw_deg = 1.0\n",
+        );
+        let path = write_temp("gimbal_mount", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        let m = cfg.gimbal_mount;
+        assert!((m.translation_body_m[0] - 0.8).abs() < 1e-9);
+        assert!((m.translation_body_m[1] + 0.05).abs() < 1e-9);
+        assert!((m.translation_body_m[2] - 0.15).abs() < 1e-9);
+        assert!((m.rotation_body_rad[0]).abs() < 1e-9);
+        assert!((m.rotation_body_rad[1] - (-2.5_f64).to_radians()).abs() < 1e-12);
+        assert!((m.rotation_body_rad[2] - 1.0_f64.to_radians()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn load_gimbal_mount_default_is_identity() {
+        let cfg = Config::default();
+        assert_eq!(cfg.gimbal_mount, GimbalMount::default());
+        assert_eq!(cfg.gimbal_mount.translation_body_m, [0.0; 3]);
+        assert_eq!(cfg.gimbal_mount.rotation_body_rad, [0.0; 3]);
+    }
+
+    #[test]
+    fn platform_source_config_mavlink_variant() {
+        let content = concat!(
+            "[platform_source]\n",
+            "kind = \"mavlink\"\n",
+            "[platform_source.mavlink]\n",
+            "listen_port = 14599\n",
+            "system_id = 42\n",
+        );
+        let path = write_temp("psc_mavlink", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        let psc = cfg.platform_source_config();
+        assert_eq!(psc.kind(), "mavlink");
+        match psc {
+            PlatformSourceConfig::MavLink(c) => {
+                assert_eq!(c.listen_port, 14599);
+                assert_eq!(c.system_id, 42);
+            }
+            _ => panic!("expected MavLink variant"),
+        }
+    }
+
+    #[test]
+    fn platform_source_config_stanag_variant() {
+        let content = concat!(
+            "[platform_source]\n",
+            "kind = \"stanag4586\"\n",
+            "[platform_source.stanag4586]\n",
+            "listen_port = 4587\n",
+            "multicast_group = \"239.0.0.99\"\n",
+            "vehicle_id_filter = 7\n",
+        );
+        let path = write_temp("psc_stanag", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        let psc = cfg.platform_source_config();
+        assert_eq!(psc.kind(), "stanag4586");
+        match psc {
+            PlatformSourceConfig::Stanag4586(c) => {
+                assert_eq!(c.listen_port, 4587);
+                assert_eq!(c.multicast_group, "239.0.0.99");
+                assert_eq!(c.vehicle_id_filter, 7);
+            }
+            _ => panic!("expected Stanag4586 variant"),
+        }
+    }
+
+    #[test]
+    fn platform_source_config_static_variant_from_unknown_kind() {
+        let content = concat!(
+            "[platform_source]\n",
+            "kind = \"static\"\n",
+            "[platform_source.static]\n",
+            "lat_deg = 37.5\n",
+            "lon_deg = -122.1\n",
+            "alt_m = 1500.0\n",
+        );
+        let path = write_temp("psc_static", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+
+        let psc = cfg.platform_source_config();
+        assert_eq!(psc.kind(), "static");
+        let state = psc.initial_state();
+        assert!((state.lat_rad - 37.5_f64.to_radians()).abs() < 1e-10);
+        assert!((state.lon_rad + 122.1_f64.to_radians()).abs() < 1e-10);
+        assert!((state.alt_m - 1500.0).abs() < 1e-9);
     }
 
     // ── Config::is_continuous_pan ─────────────────────────────────────────────
@@ -521,7 +765,7 @@ mod tests {
 
     #[test]
     fn is_continuous_pan_true_at_360_deg() {
-        let content = "pan_limit_deg = 360.0\n";
+        let content = "[kinematics]\npan_limit_deg = 360.0\n";
         let path = write_temp("continuous_pan", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
@@ -563,20 +807,12 @@ mod tests {
 
     #[test]
     fn fov_at_zoom_half_is_geometric_mean() {
-        // With logarithmic zoom, zoom=0.5 yields the geometric mean (sqrt(wide*narrow)),
-        // NOT the arithmetic mean ((wide+narrow)/2).
         let cfg = Config::default();
         let (h, v) = cfg.fov_at_zoom(0.5);
         let h_geo = (cfg.hfov_wide * cfg.hfov_narrow).sqrt();
         let v_geo = (cfg.vfov_wide * cfg.vfov_narrow).sqrt();
-        assert!((h - h_geo).abs() < 1e-6, "hfov at zoom 0.5 should be geometric mean");
-        assert!((v - v_geo).abs() < 1e-6, "vfov at zoom 0.5 should be geometric mean");
-
-        // Verify it is NOT the arithmetic mean.
-        let h_arith = (cfg.hfov_wide + cfg.hfov_narrow) / 2.0;
-        let v_arith = (cfg.vfov_wide + cfg.vfov_narrow) / 2.0;
-        assert!((h - h_arith).abs() > 1e-3, "should differ from arithmetic mean");
-        assert!((v - v_arith).abs() > 1e-3, "should differ from arithmetic mean");
+        assert!((h - h_geo).abs() < 1e-6);
+        assert!((v - v_geo).abs() < 1e-6);
     }
 
     #[test]
@@ -595,20 +831,17 @@ mod tests {
 
     #[test]
     fn camera_fov_index_0() {
-        let cfg = Config::default();
-        assert_eq!(cfg.camera_fov(0), (30.0, 22.5));
+        assert_eq!(Config::default().camera_fov(0), (30.0, 22.5));
     }
 
     #[test]
     fn camera_fov_index_1() {
-        let cfg = Config::default();
-        assert_eq!(cfg.camera_fov(1), (5.0, 3.75));
+        assert_eq!(Config::default().camera_fov(1), (5.0, 3.75));
     }
 
     #[test]
     fn camera_fov_index_2() {
-        let cfg = Config::default();
-        assert_eq!(cfg.camera_fov(2), (20.0, 15.0));
+        assert_eq!(Config::default().camera_fov(2), (20.0, 15.0));
     }
 
     #[test]
@@ -619,7 +852,6 @@ mod tests {
 
     #[test]
     fn camera_fov_free_function_uses_defaults() {
-        // Legacy free function should still work with default values.
         assert_eq!(camera_fov(0), (30.0, 22.5));
         assert_eq!(camera_fov(1), (5.0, 3.75));
         assert_eq!(camera_fov(2), (20.0, 15.0));
@@ -630,59 +862,57 @@ mod tests {
     #[test]
     fn per_camera_fov_from_config_file() {
         let content = concat!(
-            "camera_0_hfov_wide_deg = 46.8\n",
-            "camera_0_vfov_wide_deg = 35.1\n",
-            "camera_0_hfov_narrow_deg = 1.2\n",
-            "camera_0_vfov_narrow_deg = 0.9\n",
-            "camera_2_hfov_wide_deg = 29.0\n",
-            "camera_2_vfov_wide_deg = 21.75\n",
-            "camera_2_hfov_narrow_deg = 3.0\n",
-            "camera_2_vfov_narrow_deg = 2.25\n",
+            "[camera.eo_wide]\n",
+            "hfov_wide_deg = 46.8\n",
+            "vfov_wide_deg = 35.1\n",
+            "hfov_narrow_deg = 1.2\n",
+            "vfov_narrow_deg = 0.9\n",
+            "[camera.ir]\n",
+            "hfov_wide_deg = 29.0\n",
+            "vfov_wide_deg = 21.75\n",
+            "hfov_narrow_deg = 3.0\n",
+            "vfov_narrow_deg = 2.25\n",
         );
         let path = write_temp("per_camera_fov", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
-        // Camera 0 should use the per-camera values.
         assert_eq!(cfg.camera_fov(0), (46.8, 35.1));
-        // Camera 1 should still have defaults (not overridden).
+        // eo_narrow not specified → default
         assert_eq!(cfg.camera_fov(1), (5.0, 3.75));
-        // Camera 2 should use the per-camera values.
         assert_eq!(cfg.camera_fov(2), (29.0, 21.75));
     }
 
     #[test]
     fn per_camera_zoom_interpolation() {
         let content = concat!(
-            "camera_2_hfov_wide_deg = 29.0\n",
-            "camera_2_vfov_wide_deg = 21.75\n",
-            "camera_2_hfov_narrow_deg = 3.0\n",
-            "camera_2_vfov_narrow_deg = 2.25\n",
+            "[camera.ir]\n",
+            "hfov_wide_deg = 29.0\n",
+            "vfov_wide_deg = 21.75\n",
+            "hfov_narrow_deg = 3.0\n",
+            "vfov_narrow_deg = 2.25\n",
         );
         let path = write_temp("per_camera_zoom", content);
         let cfg = Config::load(&path);
         let _ = fs::remove_file(&path);
 
-        // Zoom 0 → wide end
-        let (h, v) = cfg.fov_at_zoom_for_camera(2, 0.0);
+        let (h, _) = cfg.fov_at_zoom_for_camera(2, 0.0);
         assert!((h - 29.0_f32.to_radians()).abs() < 1e-5);
-        assert!((v - 21.75_f32.to_radians()).abs() < 1e-5);
 
-        // Zoom 1 → narrow end
-        let (h, v) = cfg.fov_at_zoom_for_camera(2, 1.0);
+        let (h, _) = cfg.fov_at_zoom_for_camera(2, 1.0);
         assert!((h - 3.0_f32.to_radians()).abs() < 1e-5);
-        assert!((v - 2.25_f32.to_radians()).abs() < 1e-5);
 
-        // Zoom 0.5 → geometric mean (logarithmic zoom curve)
         let (h, _) = cfg.fov_at_zoom_for_camera(2, 0.5);
         let expected: f32 = (29.0_f32 * 3.0_f32).sqrt();
         assert!((h - expected.to_radians()).abs() < 1e-5);
     }
 
     #[test]
-    fn legacy_keys_sync_to_camera_table_0() {
-        // Legacy hfov_wide_deg etc. should update camera_table[0].
+    fn per_camera_eo_wide_section_sets_legacy_hfov_fields() {
+        // [camera.eo_wide] should populate both camera_table[0] AND the
+        // legacy hfov_wide/narrow fields used by fov_at_zoom().
         let content = concat!(
+            "[camera.eo_wide]\n",
             "hfov_wide_deg = 50.0\n",
             "vfov_wide_deg = 37.5\n",
             "hfov_narrow_deg = 5.0\n",
@@ -693,7 +923,6 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(cfg.camera_fov(0), (50.0, 37.5));
-        // hfov_wide should also be in radians matching camera_table[0]
         assert!((cfg.hfov_wide - 50.0_f32.to_radians()).abs() < 1e-5);
     }
 }

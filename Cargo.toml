@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 sim-core = { path = "../sim-core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [build-dependencies]
 roxmltree = "0.20"

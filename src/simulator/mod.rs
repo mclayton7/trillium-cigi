@@ -16,11 +16,11 @@
 
 use std::f32::consts::PI;
 
-use crate::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse, StartOfFrame};
+use sim_core::cigi::messages::{EntityControl, SensorControl, SensorExtendedResponse, StartOfFrame};
 use crate::config::Config;
 use crate::faults::{FaultState, lcg_noise_f32};
-use crate::geo;
 use crate::orion::{GeolocateTelemetryCorePacket, OrionMode, PrimaryTrackData};
+use sim_core::geo;
 
 // ─────────────────────────────────────────── constants (kept for tests) ──
 
@@ -401,7 +401,10 @@ impl GimbalSimulator {
                     let (tp, tt) = geo::inverse_geopoint(
                         self.pos_lat, self.pos_lon, self.pos_alt,
                         self.platform_yaw,
+                        self.platform_roll, self.platform_pitch,
+                        self.config.stabilization_quality,
                         self.geopoint_lat, self.geopoint_lon, self.geopoint_alt,
+                        &self.config.gimbal_mount,
                     );
                     self.set_target(tp, tt);
                     tick_axis_trap(
@@ -490,6 +493,7 @@ impl GimbalSimulator {
             self.pan_jittered, self.tilt_jittered,
             self.config.refraction_enabled,
             self.config.terrain_elevation_m,
+            &self.config.gimbal_mount,
         ) {
             self.look_lat = ll;
             self.look_lon = lo;
@@ -660,6 +664,7 @@ impl GimbalSimulator {
             self.config.stabilization_quality,
             self.pan,
             self.tilt,
+            &self.config.gimbal_mount,
         );
 
         // Track data.
@@ -784,7 +789,7 @@ mod tests {
     #[test]
     fn apply_sensor_control_sets_mode() {
         let mut sim = GimbalSimulator::default();
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             gain: 0.75, // → pan target = 0.5π
             level: 0.5, // → tilt target = 0.0
@@ -803,7 +808,7 @@ mod tests {
     #[test]
     fn sensor_response_end_to_end() {
         let mut sim = GimbalSimulator::default();
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             gain: 0.75,
             level: 0.5,
@@ -822,7 +827,7 @@ mod tests {
     #[test]
     fn angle_limits_enforced() {
         let mut sim = GimbalSimulator::default();
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             gain: 1.0,  // → raw pan = +π ≈ 180°, exceeds ±170° limit
             level: 0.0, // → raw tilt = −π ≈ −180°, exceeds −110° limit
@@ -847,7 +852,7 @@ mod tests {
     #[test]
     fn rate_mode_integrates() {
         let mut sim = GimbalSimulator::default();
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             track_mode: 1, // → rate mode
             gain: 0.75,    // → pan_rate_cmd = +0.25 * max_slew_rate
@@ -871,7 +876,7 @@ mod tests {
         // With a small dt, the rate should ramp toward the commanded rate
         // rather than jumping to it instantly.
         let mut sim = GimbalSimulator::default();
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             track_mode: 1, // → rate mode
             gain: 1.0,     // → pan_rate_cmd = +max_slew_rate (~1.047 rad/s)
@@ -917,7 +922,7 @@ mod tests {
     fn camera_switch_blackout() {
         let mut sim = GimbalSimulator::default();
         // Command camera 1
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             sensor_id: 1,
             ..Default::default()
@@ -1034,7 +1039,7 @@ mod tests {
         let mut sim = GimbalSimulator::with_config(cfg);
         sim.mode = OrionMode::OrionModeGeopoint;
         // Simulate receiving a SensorControl that sets geopoint mode.
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             view_id: 0,
             sensor_id: 0,
             sensor_state: 4, // Geopoint mode
@@ -1247,7 +1252,7 @@ mod tests {
         // Commanded to -3.0 rad. The naive target would be -3.0, but shortest
         // path from +π is to go to -3.0 + 2π ≈ +3.28 (just past +π going CCW is wrong;
         // actually wrap_angle(-3.0 - π) is in (-π, π]).
-        let sc = crate::cigi::messages::SensorControl {
+        let sc = sim_core::cigi::messages::SensorControl {
             sensor_state: 1,
             // Encode -3.0 rad as gain: g = (target/π + 1) * 0.5 = (-3/π + 1)*0.5
             gain: ((-3.0_f32 / PI) + 1.0) * 0.5,
@@ -1316,6 +1321,100 @@ mod tests {
         assert!(
             (sim_clean.pan_jittered - sim_clean.pan).abs() < 1e-9,
             "zero-jitter sim: pan_jittered should equal pan"
+        );
+    }
+
+    // ── Gimbal mount ──────────────────────────────────────────────────────
+
+    #[test]
+    fn gimbal_mount_translation_shifts_look_point() {
+        // A simulator configured with a 20 m forward mount translation should
+        // see its nadir look-point shifted 20 m north of the platform lat/lon
+        // (platform level, yaw=0). Same setup without the mount serves as the
+        // baseline.
+        let mut baseline_cfg = Config::default();
+        baseline_cfg.jitter_amplitude = 0.0;
+        baseline_cfg.noise_floor = 0.0;
+
+        let mut mount_cfg = baseline_cfg.clone();
+        mount_cfg.gimbal_mount = sim_core::geo::GimbalMount {
+            translation_body_m: [20.0, 0.0, 0.0],
+            rotation_body_rad: [0.0; 3],
+        };
+
+        let mut sim_base = GimbalSimulator::with_config(baseline_cfg);
+        let mut sim_mount = GimbalSimulator::with_config(mount_cfg);
+
+        for s in [&mut sim_base, &mut sim_mount] {
+            s.pos_lat = 0.5_f64;
+            s.pos_lon = -1.5_f64;
+            s.pos_alt = 2000.0;
+            s.platform_yaw = 0.0;
+            s.platform_roll = 0.0;
+            s.platform_pitch = 0.0;
+            s.mode = OrionMode::OrionModePosition;
+            s.target_pan = 0.0;
+            s.target_tilt = std::f32::consts::FRAC_PI_2; // nadir
+        }
+
+        // Converge both.
+        for _ in 0..80 {
+            sim_base.tick(0.02);
+            sim_mount.tick(0.02);
+        }
+
+        // The mount-equipped simulator's look-point should be ~20 m north,
+        // which translates to a positive latitude shift of ~20/6.371e6 rad.
+        // Jitter is off and the gimbal converged, so the difference should
+        // be driven purely by the mount translation. Allow a generous margin
+        // to absorb the small NED-frame approximation drift.
+        let dn_m = (sim_mount.look_lat - sim_base.look_lat) * 6_371_000.0;
+        assert!(
+            (dn_m - 20.0).abs() < 0.5,
+            "expected ~20 m north shift, got {:.3} m",
+            dn_m
+        );
+    }
+
+    #[test]
+    fn gimbal_mount_rotation_changes_geopoint_target() {
+        // Same platform state + same commanded geopoint target, one sim with
+        // a zero mount and one with a 5° mount yaw offset. The required
+        // pan/tilt (inverse geopoint) must differ by the mount yaw offset.
+        let mut cfg_a = Config::default();
+        cfg_a.jitter_amplitude = 0.0;
+        cfg_a.noise_floor = 0.0;
+
+        let mut cfg_b = cfg_a.clone();
+        cfg_b.gimbal_mount = sim_core::geo::GimbalMount {
+            translation_body_m: [0.0; 3],
+            rotation_body_rad: [0.0, 0.0, 5.0_f64.to_radians()],
+        };
+
+        let mut sim_a = GimbalSimulator::with_config(cfg_a);
+        let mut sim_b = GimbalSimulator::with_config(cfg_b);
+
+        for s in [&mut sim_a, &mut sim_b] {
+            s.pos_lat = 0.5;
+            s.pos_lon = -1.5;
+            s.pos_alt = 2000.0;
+            s.mode = OrionMode::OrionModeGeopoint;
+            s.geopoint_lat = 0.5001;
+            s.geopoint_lon = -1.4999;
+            s.geopoint_alt = 0.0;
+        }
+
+        // Single tick recomputes set_target from inverse_geopoint.
+        sim_a.tick(0.02);
+        sim_b.tick(0.02);
+
+        // The mount-yaw-offset sim should command a pan that is 5° less than
+        // the baseline (its boresight already points 5° further along yaw).
+        let delta = sim_a.target_pan - sim_b.target_pan;
+        assert!(
+            (delta - 5.0_f32.to_radians()).abs() < 1e-4,
+            "expected 5° pan delta, got {}°",
+            delta.to_degrees()
         );
     }
 

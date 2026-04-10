@@ -1,8 +1,13 @@
 // Convert Orion commands / platform state → CIGI packets sent to the scene generator.
+//
+// Payload-agnostic CIGI builders (`make_ig_control`, `platform_to_entity_control`,
+// `build_view_control`, `build_wire_sensor_control`) live in
+// `sim_core::cigi::build`. This file holds only the Orion-specific adapters.
 
-use crate::cigi::messages::{EntityControl, IgControl, SensorControl, SensorExtendedResponse};
+use sim_core::cigi::build::build_view_control;
+use sim_core::cigi::messages::{SensorControl, SensorExtendedResponse, ViewControl};
 use crate::orion::{GeolocateTelemetryCorePacket, OrionCmdPacket, OrionMode};
-use crate::platform::PlatformState;
+use sim_core::geo::GimbalMount;
 
 // ── Simulator compatibility ────────────────────────────────────────────────
 
@@ -37,37 +42,6 @@ fn orion_mode_to_sensor_status(mode: OrionMode) -> u8 {
         OrionMode::OrionModeDisabled | OrionMode::OrionModeFault => 3, // Breaklock
         OrionMode::OrionModeTrack => 1,                                // Tracking
         _ => 0,                                                        // Searching/Active
-    }
-}
-
-/// Build an `IgControl` packet for the given host frame counter.
-pub fn make_ig_control(host_frame: u32) -> IgControl {
-    IgControl {
-        ig_mode: 0, // Normal operation
-        frame_ctr: host_frame,
-        last_rcvd_ig_frame_ctr: 0,
-        timestamp_valid: false,
-        extrapolation_enable: false,
-        minor_version: 3,
-        db_number: 1,
-        timestamp: 0.0,
-    }
-}
-
-/// Build an `EntityControl` packet from the current platform state.
-///
-/// `entity_id` should be the IG entity that represents the sensor platform.
-pub fn platform_to_entity_control(platform: &PlatformState, entity_id: u16) -> EntityControl {
-    EntityControl {
-        entity_id,
-        entity_state: 1, // Active
-        roll: platform.roll_rad.to_degrees(),
-        pitch: platform.pitch_rad.to_degrees(),
-        yaw: platform.yaw_rad.to_degrees(),
-        lat_or_x: platform.lat_rad.to_degrees(),
-        lon_or_y: platform.lon_rad.to_degrees(),
-        alt_or_z: platform.alt_m,
-        ..EntityControl::default()
     }
 }
 
@@ -122,11 +96,52 @@ pub fn orion_cmd_to_sensor_control(cmd: &OrionCmdPacket) -> SensorControl {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Wire-side CIGI packets (Host → IG scene generator)
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Important: the existing `orion_cmd_to_sensor_control` above is an **internal**
+// protocol between this bridge and its own fallback `GimbalSimulator` — it
+// packs pan/tilt targets into `gain`/`level` and zoom into `ac_coupling`. The
+// scene generator (camera-simulator, UE5) does not speak that protocol: it
+// reads `Gain` as a FOV preset index (see Step 1 verification) and expects
+// gimbal pose on CIGI ViewControl (type 16) attached to the platform entity.
+//
+// The helpers below produce packets for the **on-the-wire** path, using CIGI
+// semantics that match the camera-simulator CCL decoder.
+
+/// Build a CIGI ViewControl (type 16) that attaches the view to the platform
+/// entity, positions its origin at the gimbal base (mount translation), and
+/// points it with the composed `R_mount · R_gimbal` rotation (mount boresight
+/// offset + current gimbal pan/tilt), expressed in entity body frame as
+/// ZYX Euler angles.
+///
+/// - `view_id`: CIGI view identifier (single-sensor scenes may use 1)
+/// - `entity_id`: CIGI entity the view is attached to (the platform)
+///
+/// The pan/tilt used come from the Orion command in Position mode; for other
+/// modes (Rate, Track, Geopoint) the Rust-side simulator is authoritative —
+/// callers should read current `GimbalSimulator::pan/tilt` instead of using
+/// this single-shot conversion. See `main.rs` for the tick-loop wiring.
+pub fn orion_cmd_to_view_control(
+    cmd: &OrionCmdPacket,
+    mount: &GimbalMount,
+    view_id: u16,
+    entity_id: u16,
+) -> ViewControl {
+    match cmd.cmd.mode {
+        OrionMode::OrionModePosition => {
+            build_view_control(cmd.cmd.target[0], cmd.cmd.target[1], mount, view_id, entity_id)
+        }
+        _ => build_view_control(0.0, 0.0, mount, view_id, entity_id),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orion::{GeolocateTelemetryCorePacket, OrionCmdPacket, OrionMode};
-    use crate::platform::PlatformState;
     use std::f32::consts::PI as PI32;
     use std::f64::consts::PI as PI64;
 
@@ -202,50 +217,10 @@ mod tests {
         assert_eq!(r.gate_y_size, 20);
     }
 
-    // ── make_ig_control ──────────────────────────────────────────────────────
-
-    #[test]
-    fn ig_control_fields() {
-        let ig = make_ig_control(42);
-        assert_eq!(ig.ig_mode, 0);
-        assert_eq!(ig.frame_ctr, 42);
-        assert_eq!(ig.minor_version, 3);
-        assert_eq!(ig.db_number, 1);
-        assert!(!ig.timestamp_valid);
-    }
-
-    // ── platform_to_entity_control ───────────────────────────────────────────
-
-    #[test]
-    fn entity_control_entity_id_passed_through() {
-        let ec = platform_to_entity_control(&PlatformState::default(), 5);
-        assert_eq!(ec.entity_id, 5);
-    }
-
-    #[test]
-    fn entity_control_lat_lon_rad_to_deg() {
-        let mut p = PlatformState::default();
-        p.lat_rad = PI64 / 4.0;
-        p.lon_rad = -PI64 / 3.0;
-        let ec = platform_to_entity_control(&p, 0);
-        assert!((ec.lat_or_x - 45.0).abs() < 1e-10, "lat_or_x={}", ec.lat_or_x);
-        assert!((ec.lon_or_y - (-60.0)).abs() < 1e-10, "lon_or_y={}", ec.lon_or_y);
-    }
-
-    #[test]
-    fn entity_control_alt_and_attitude() {
-        let mut p = PlatformState::default();
-        p.alt_m = 500.0;
-        p.roll_rad = PI32 / 6.0;
-        p.pitch_rad = PI32 / 4.0;
-        p.yaw_rad = PI32 / 2.0;
-        let ec = platform_to_entity_control(&p, 0);
-        assert!((ec.alt_or_z - 500.0).abs() < 1e-9);
-        assert!((ec.roll - 30.0).abs() < 1e-4, "roll={}", ec.roll);
-        assert!((ec.pitch - 45.0).abs() < 1e-4, "pitch={}", ec.pitch);
-        assert!((ec.yaw - 90.0).abs() < 1e-4, "yaw={}", ec.yaw);
-        assert_eq!(ec.entity_state, 1);
-    }
+    // Note: `make_ig_control`, `platform_to_entity_control`, `build_view_control`,
+    // and `build_wire_sensor_control` moved to `sim_core::cigi::build` in
+    // Phase 3c Item 2. Their unit tests now live in
+    // `sim-core/src/cigi/build.rs`.
 
     // ── orion_cmd_to_sensor_control ──────────────────────────────────────────
 
@@ -316,4 +291,65 @@ mod tests {
         let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeGeopoint, [0.0, 0.0]));
         assert_eq!(sc.sensor_state, 4);
     }
+
+    // ── orion_cmd_to_view_control / build_view_control ────────────────────
+
+    #[test]
+    fn view_control_position_mode_zero_mount_passes_pan_tilt_through() {
+        // Pan = 30°, tilt = -15° (negative depression = look up 15°). With zero
+        // mount, ViewControl yaw should equal pan and pitch should equal +15°
+        // (nose-up corresponds to tilt = -depression).
+        let cmd = make_cmd(
+            OrionMode::OrionModePosition,
+            [30.0_f32.to_radians(), -15.0_f32.to_radians()],
+        );
+        let vc = orion_cmd_to_view_control(&cmd, &GimbalMount::default(), 1, 1);
+        assert_eq!(vc.view_id, 1);
+        assert_eq!(vc.entity_id, 1);
+        assert!(vc.x_off_en && vc.y_off_en && vc.z_off_en);
+        assert!(vc.roll_en && vc.pitch_en && vc.yaw_en);
+        assert!((vc.yaw_deg - 30.0).abs() < 1e-4, "yaw {}", vc.yaw_deg);
+        assert!((vc.pitch_deg - 15.0).abs() < 1e-4, "pitch {}", vc.pitch_deg);
+        assert!(vc.roll_deg.abs() < 1e-4, "roll {}", vc.roll_deg);
+    }
+
+    #[test]
+    fn view_control_mount_yaw_offset_adds_to_pan() {
+        // 3° mount yaw offset + 10° pan → composed yaw = 13°.
+        let cmd = make_cmd(OrionMode::OrionModePosition, [10.0_f32.to_radians(), 0.0]);
+        let mount = GimbalMount {
+            translation_body_m: [0.0; 3],
+            rotation_body_rad: [0.0, 0.0, 3.0_f64.to_radians()],
+        };
+        let vc = orion_cmd_to_view_control(&cmd, &mount, 1, 1);
+        assert!((vc.yaw_deg - 13.0).abs() < 1e-4, "yaw {}", vc.yaw_deg);
+        assert!(vc.pitch_deg.abs() < 1e-4);
+    }
+
+    #[test]
+    fn view_control_mount_translation_emitted_in_offsets() {
+        let cmd = make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]);
+        let mount = GimbalMount {
+            translation_body_m: [0.8, -0.1, 0.25],
+            rotation_body_rad: [0.0; 3],
+        };
+        let vc = orion_cmd_to_view_control(&cmd, &mount, 7, 3);
+        assert_eq!(vc.view_id, 7);
+        assert_eq!(vc.entity_id, 3);
+        assert!((vc.x_off_m - 0.8).abs() < 1e-6);
+        assert!((vc.y_off_m + 0.1).abs() < 1e-6);
+        assert!((vc.z_off_m - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn view_control_non_position_mode_emits_zero_pan_tilt() {
+        // Rate / Track / Geopoint don't carry raw pan/tilt in target[0..2].
+        // orion_cmd_to_view_control zeros pan/tilt; callers should use
+        // build_view_control with sim state for those modes.
+        let cmd = make_cmd(OrionMode::OrionModeRate, [1.0, 0.5]);
+        let vc = orion_cmd_to_view_control(&cmd, &GimbalMount::default(), 1, 1);
+        assert!(vc.yaw_deg.abs() < 1e-4);
+        assert!(vc.pitch_deg.abs() < 1e-4);
+    }
+
 }
