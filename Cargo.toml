@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-sim-core = { path = "../sim-core" }
+# sim-core lives in the sibling sim-environment/ git repo, which the
+# parent directory keeps as a peer of this crate. The path traversal
+# `../sim-environment/sim-core` is stable because both repos are
+# checked out under /opt/mac/sim-environment/ by convention.
+sim-core = { path = "../sim-environment/sim-core" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
