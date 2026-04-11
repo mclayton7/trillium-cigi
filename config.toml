@@ -51,7 +51,7 @@ gimbal_mount_yaw_deg   = 0.0
 [platform_source]
 # "static" (default): use config values above, never updated.
 # "mavlink": receive real-time position/attitude from a MAVLink autopilot over UDP.
-platform_source      = mavlink
+platform_source      = "mavlink"
 mavlink_listen_port  = 14550
 mavlink_system_id    = 0
 stanag_listen_port   = 4586
