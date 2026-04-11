@@ -68,4 +68,11 @@ RUN chmod +x /opt/trillium-cigi/cigi_trillium \
 USER trillium
 WORKDIR /opt/trillium-cigi
 
+# sim-environment orchestrator Phase 6 healthcheck. Probe the Orion
+# TCP listener on :8008 with netcat (installed in the runtime image
+# above). 10s interval matches the orchestrator's HealthMonitor tick
+# cadence so /status reflects trillium state within one cycle.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+    CMD nc -z 127.0.0.1 8008 || exit 1
+
 ENTRYPOINT ["/opt/trillium-cigi/cigi_trillium"]
