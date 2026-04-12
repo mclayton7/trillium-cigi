@@ -16,7 +16,7 @@
 # `cargo build --release` from inside the crate directory; sim-core is
 # resolved via the relative path dep declared in trillium-cigi/Cargo.toml.
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.90-bookworm AS builder
 
 WORKDIR /build
 
