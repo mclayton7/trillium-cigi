@@ -3,7 +3,6 @@
 # Lines starting with '#' or '[section]' headers are ignored.
 
 [network]
-port = 8008
 orion_listen_port = 8008
 scene_generator_ip = "127.0.0.1"
 scene_generator_cigi_port = 8888
