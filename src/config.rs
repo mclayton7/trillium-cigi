@@ -79,6 +79,11 @@ pub struct Config {
     pub jitter_amplitude: f32,
     /// White-noise floor (rad RMS). Default: ~0.01° ≈ 0.175 mrad.
     pub noise_floor: f32,
+    /// Second structural resonance frequency (Hz). Default: 47 Hz (non-harmonic
+    /// with the 10 Hz primary to produce realistic beat patterns).
+    pub jitter_freq_2: f32,
+    /// Peak amplitude of the second resonance (rad). Default: ~0.01°.
+    pub jitter_amplitude_2: f32,
 
     // ── Stabilization ─────────────────────────────────────
     /// Stabilization quality factor: 0.0 = perfect inertial stabilization,
@@ -108,6 +113,22 @@ pub struct Config {
     pub track_d_gain: f32,
     /// Track loss threshold (fractional FOV, 0–1). Default: 0.45.
     pub track_loss_threshold: f32,
+    /// Angular extent of the tracking gate (deg). Default: 1.0 deg.
+    /// Combined with the current HFOV to compute gate_x/y_size in pixels.
+    pub track_gate_size_deg: f32,
+    /// Assumed linear size of the tracked target (metres). Default: 2.0 m.
+    /// Used together with slant range to derive `PrimaryTrackData::size`.
+    pub track_target_size_m: f32,
+
+    // ── Laser rangefinder ─────────────────────────────────
+    /// Maximum laser rangefinder range (metres). Default: 20 km.
+    /// Beyond this, `range_source` falls back to `RangeSrcNone`.
+    pub laser_max_range_m: f64,
+
+    // ── Cross-axis coupling ───────────────────────────────
+    /// Cross-axis gyroscopic coupling factor. 0.0 disables the model.
+    /// Non-zero values (e.g. 0.02) model imperfect direct-drive compensation.
+    pub gyro_coupling_factor: f32,
 
     // ── Platform source ───────────────────────────────
     /// Platform source selector: `"static"` (default), `"mavlink"`, or `"stanag4586"`.
@@ -155,6 +176,8 @@ impl Default for Config {
             jitter_freq: 10.0,
             jitter_amplitude: 0.05_f32.to_radians(),
             noise_floor: 0.01_f32.to_radians(),
+            jitter_freq_2: 47.0,
+            jitter_amplitude_2: 0.01_f32.to_radians(),
             stabilization_quality: 0.0,
             gimbal_mount: GimbalMount::default(),
             refraction_enabled: true,
@@ -163,6 +186,10 @@ impl Default for Config {
             track_p_gain: 3.0,
             track_d_gain: 0.5,
             track_loss_threshold: 0.45,
+            track_gate_size_deg: 1.0,
+            track_target_size_m: 2.0,
+            laser_max_range_m: 20_000.0,
+            gyro_coupling_factor: 0.0,
             platform_source: "static".to_string(),
             mavlink_listen_port: 14550,
             mavlink_system_id: 0,
@@ -194,6 +221,8 @@ struct ConfigFile {
     terrain: TerrainSection,
     geopoint: GeopointSection,
     track: TrackSection,
+    laser: LaserSection,
+    coupling: CouplingSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -275,6 +304,8 @@ struct VibrationSection {
     jitter_freq_hz: Option<f32>,
     jitter_amplitude_deg: Option<f32>,
     noise_floor_deg: Option<f32>,
+    jitter_freq_2_hz: Option<f32>,
+    jitter_amplitude_2_deg: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -318,6 +349,20 @@ struct TrackSection {
     p_gain: Option<f32>,
     d_gain: Option<f32>,
     loss_threshold: Option<f32>,
+    gate_size_deg: Option<f32>,
+    target_size_m: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LaserSection {
+    max_range_m: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CouplingSection {
+    gyro_factor: Option<f32>,
 }
 
 impl From<ConfigFile> for Config {
@@ -368,6 +413,8 @@ impl From<ConfigFile> for Config {
         if let Some(v) = f.vibration.jitter_freq_hz { cfg.jitter_freq = v; }
         if let Some(v) = f.vibration.jitter_amplitude_deg { cfg.jitter_amplitude = v.to_radians(); }
         if let Some(v) = f.vibration.noise_floor_deg { cfg.noise_floor = v.to_radians(); }
+        if let Some(v) = f.vibration.jitter_freq_2_hz { cfg.jitter_freq_2 = v; }
+        if let Some(v) = f.vibration.jitter_amplitude_2_deg { cfg.jitter_amplitude_2 = v.to_radians(); }
 
         // ── Stabilization ──
         if let Some(v) = f.stabilization.quality { cfg.stabilization_quality = v.clamp(0.0, 1.0); }
@@ -387,6 +434,12 @@ impl From<ConfigFile> for Config {
         if let Some(v) = f.track.p_gain { cfg.track_p_gain = v; }
         if let Some(v) = f.track.d_gain { cfg.track_d_gain = v; }
         if let Some(v) = f.track.loss_threshold { cfg.track_loss_threshold = v.clamp(0.0, 1.0); }
+        if let Some(v) = f.track.gate_size_deg { cfg.track_gate_size_deg = v.max(0.0); }
+        if let Some(v) = f.track.target_size_m { cfg.track_target_size_m = v.max(0.0); }
+
+        // ── Laser / coupling ──
+        if let Some(v) = f.laser.max_range_m { cfg.laser_max_range_m = v.max(0.0); }
+        if let Some(v) = f.coupling.gyro_factor { cfg.gyro_coupling_factor = v; }
 
         cfg
     }

@@ -14,20 +14,31 @@ use sim_core::geo::GimbalMount;
 /// Map Orion `GeolocateTelemetryCorePacket` → CIGI `SensorExtendedResponse`.
 ///
 /// Called by `GimbalSimulator::to_sensor_extended_response()` in fallback mode.
+/// `settled` reports whether Position/Geopoint has converged on its target
+/// (error < 0.01 rad on both axes); `track_active` is only meaningful in
+/// `OrionModeTrack` and drives Tracking vs Breaklock for that mode.
+///
+/// Per CIGI v3.3, `gate_x_pos`/`gate_y_pos` carry the image-plane gate centroid
+/// (not gimbal pan/tilt). The base conversion sets them to 0.0; the simulator
+/// overrides them for track mode.
 pub fn telemetry_to_sensor_extended_response(
     telem: &GeolocateTelemetryCorePacket,
     view_id: u16,
     sensor_id: u8,
+    settled: bool,
+    track_active: bool,
 ) -> SensorExtendedResponse {
     let deg = 180.0 / std::f64::consts::PI;
     SensorExtendedResponse {
         view_id,
         sensor_id,
-        sensor_status: orion_mode_to_sensor_status(telem.mode),
+        sensor_status: orion_mode_to_sensor_status(telem.mode, settled, track_active),
+        // Default gate size; the simulator overrides this with a value derived
+        // from the current FOV and `track_gate_size_deg`.
         gate_x_size: 20,
         gate_y_size: 20,
-        gate_x_pos: telem.pan.to_degrees(),
-        gate_y_pos: telem.tilt.to_degrees(),
+        gate_x_pos: 0.0,
+        gate_y_pos: 0.0,
         frame_ctr: telem.system_time,
         entity_id_valid: false,
         entity_id: 0,
@@ -37,11 +48,16 @@ pub fn telemetry_to_sensor_extended_response(
     }
 }
 
-fn orion_mode_to_sensor_status(mode: OrionMode) -> u8 {
+fn orion_mode_to_sensor_status(mode: OrionMode, settled: bool, track_active: bool) -> u8 {
     match mode {
-        OrionMode::OrionModeDisabled | OrionMode::OrionModeFault => 3, // Breaklock
-        OrionMode::OrionModeTrack => 1,                                // Tracking
-        _ => 0,                                                        // Searching/Active
+        OrionMode::OrionModePosition
+        | OrionMode::OrionModeGeopoint
+        | OrionMode::OrionModePositionNoLimits => {
+            if settled { 0 } else { 2 } // Locked vs Slewing
+        }
+        OrionMode::OrionModeRate => 2,                                 // Slewing
+        OrionMode::OrionModeTrack => if track_active { 1 } else { 3 }, // Tracking / Breaklock
+        _ => 3,                                                        // Breaklock
     }
 }
 
@@ -56,7 +72,11 @@ fn orion_mode_to_sensor_status(mode: OrionMode) -> u8 {
 ///
 /// Pan/tilt target mapping (Position mode):  target[0..1] (rad) → gain/level via ±π scale.
 /// Pan/tilt rate mapping (Rate mode):        target[0..1] (rad/s) → gain/level via ±MAX_RATE scale.
-pub fn orion_cmd_to_sensor_control(cmd: &OrionCmdPacket) -> SensorControl {
+pub fn orion_cmd_to_sensor_control(
+    cmd: &OrionCmdPacket,
+    camera_index: i8,
+    zoom_level: f32,
+) -> SensorControl {
     use std::f32::consts::PI;
     let max_rate = crate::convert::MAX_SLEW_RATE;
 
@@ -85,13 +105,21 @@ pub fn orion_cmd_to_sensor_control(cmd: &OrionCmdPacket) -> SensorControl {
         }
     };
 
+    // In Geopoint mode `ac_coupling` carries the lat encoding, so leave it at
+    // its default. In Position/Rate modes, forward the zoom level.
+    let ac_coupling = match cmd.cmd.mode {
+        OrionMode::OrionModeGeopoint => 0.0,
+        _ => zoom_level.clamp(0.0, 1.0),
+    };
+
     SensorControl {
-        sensor_id: 0, // camera 0 by default; override from cmd if available
+        sensor_id: camera_index.clamp(0, 2) as u8,
         view_id: 0,
         sensor_state,
         track_mode,
         gain,
         level,
+        ac_coupling,
         ..SensorControl::default()
     }
 }
@@ -148,13 +176,16 @@ mod tests {
     // ── telemetry_to_sensor_extended_response ────────────────────────────────
 
     #[test]
-    fn telem_pan_tilt_rad_to_deg() {
+    fn telem_gate_pos_boresighted() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pan = PI32 / 4.0;
         t.tilt = -PI32 / 6.0;
-        let r = telemetry_to_sensor_extended_response(&t, 0, 0);
-        assert!((r.gate_x_pos - 45.0).abs() < 1e-4, "gate_x_pos={}", r.gate_x_pos);
-        assert!((r.gate_y_pos - (-30.0)).abs() < 1e-4, "gate_y_pos={}", r.gate_y_pos);
+        let r = telemetry_to_sensor_extended_response(&t, 0, 0, false, false);
+        // Per CIGI v3.3, gate positions are image-plane centroids, not pan/tilt.
+        // The base conversion sets them to 0.0 (bore-sighted); the simulator
+        // overrides them for track mode in to_sensor_extended_response().
+        assert_eq!(r.gate_x_pos, 0.0);
+        assert_eq!(r.gate_y_pos, 0.0);
     }
 
     #[test]
@@ -162,7 +193,7 @@ mod tests {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pos_lat = PI64 / 2.0;
         t.pos_lon = -PI64 / 4.0;
-        let r = telemetry_to_sensor_extended_response(&t, 0, 0);
+        let r = telemetry_to_sensor_extended_response(&t, 0, 0, false, false);
         assert!((r.entity_lat - 90.0).abs() < 1e-10, "entity_lat={}", r.entity_lat);
         assert!((r.entity_lon - (-45.0)).abs() < 1e-10, "entity_lon={}", r.entity_lon);
     }
@@ -171,48 +202,73 @@ mod tests {
     fn telem_alt_passes_through() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.pos_alt = 1234.5;
-        let r = telemetry_to_sensor_extended_response(&t, 0, 0);
+        let r = telemetry_to_sensor_extended_response(&t, 0, 0, false, false);
         assert!((r.entity_alt - 1234.5).abs() < 1e-9);
     }
 
     #[test]
     fn telem_view_and_sensor_id_passed_through() {
-        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 7, 3);
+        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 7, 3, false, false);
         assert_eq!(r.view_id, 7);
         assert_eq!(r.sensor_id, 3);
     }
 
     #[test]
-    fn telem_sensor_status_track() {
+    fn telem_sensor_status_track_active() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.mode = OrionMode::OrionModeTrack;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).sensor_status, 1);
+        // track_active=true → Tracking (1)
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false, true).sensor_status, 1);
+    }
+
+    #[test]
+    fn telem_sensor_status_track_lost_is_breaklock() {
+        let mut t = GeolocateTelemetryCorePacket::default();
+        t.mode = OrionMode::OrionModeTrack;
+        // Track mode with track_active=false → Breaklock (3)
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false, false).sensor_status, 3);
     }
 
     #[test]
     fn telem_sensor_status_disabled() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.mode = OrionMode::OrionModeDisabled;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).sensor_status, 3);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false, false).sensor_status, 3);
     }
 
     #[test]
-    fn telem_sensor_status_position() {
+    fn telem_sensor_status_position_settled() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.mode = OrionMode::OrionModePosition;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).sensor_status, 0);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, true, false).sensor_status, 0);
+    }
+
+    #[test]
+    fn telem_sensor_status_position_slewing() {
+        let mut t = GeolocateTelemetryCorePacket::default();
+        t.mode = OrionMode::OrionModePosition;
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false, false).sensor_status, 2);
+    }
+
+    #[test]
+    fn telem_sensor_status_rate_always_slewing() {
+        let mut t = GeolocateTelemetryCorePacket::default();
+        t.mode = OrionMode::OrionModeRate;
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false, false).sensor_status, 2);
+        // Even with settled=true, rate mode is always slewing.
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, true, false).sensor_status, 2);
     }
 
     #[test]
     fn telem_frame_ctr_from_system_time() {
         let mut t = GeolocateTelemetryCorePacket::default();
         t.system_time = 9876;
-        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0).frame_ctr, 9876);
+        assert_eq!(telemetry_to_sensor_extended_response(&t, 0, 0, false, false).frame_ctr, 9876);
     }
 
     #[test]
     fn telem_gate_sizes_are_20() {
-        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 0, 0);
+        let r = telemetry_to_sensor_extended_response(&GeolocateTelemetryCorePacket::default(), 0, 0, false, false);
         assert_eq!(r.gate_x_size, 20);
         assert_eq!(r.gate_y_size, 20);
     }
@@ -233,19 +289,19 @@ mod tests {
 
     #[test]
     fn sc_disabled_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeDisabled, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeDisabled, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 0);
     }
 
     #[test]
     fn sc_fault_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeFault, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeFault, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 0);
     }
 
     #[test]
     fn sc_position_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32 / 2.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32 / 2.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 1);
         assert_eq!(sc.track_mode, 0);
         assert!((sc.gain - 0.75).abs() < 1e-5, "gain={}", sc.gain);
@@ -254,15 +310,15 @@ mod tests {
 
     #[test]
     fn sc_position_centre_is_half() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [0.0, 0.0]), 0, 0.0);
         assert!((sc.gain - 0.5).abs() < 1e-5);
         assert!((sc.level - 0.5).abs() < 1e-5);
     }
 
     #[test]
     fn sc_position_full_range() {
-        let sc_max = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32, 0.0]));
-        let sc_min = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [-PI32, 0.0]));
+        let sc_max = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [PI32, 0.0]), 0, 0.0);
+        let sc_min = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModePosition, [-PI32, 0.0]), 0, 0.0);
         assert!((sc_max.gain - 1.0).abs() < 1e-5);
         assert!((sc_min.gain - 0.0).abs() < 1e-5);
     }
@@ -270,9 +326,9 @@ mod tests {
     #[test]
     fn sc_rate_mode() {
         let max = crate::convert::MAX_SLEW_RATE;
-        let sc_pos = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [max, 0.0]));
-        let sc_neg = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [-max, 0.0]));
-        let sc_zero = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [0.0, 0.0]));
+        let sc_pos = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [max, 0.0]), 0, 0.0);
+        let sc_neg = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [-max, 0.0]), 0, 0.0);
+        let sc_zero = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeRate, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc_pos.sensor_state, 1);
         assert_eq!(sc_pos.track_mode, 0x01);
         assert!((sc_pos.gain - 1.0).abs() < 1e-5);
@@ -282,13 +338,13 @@ mod tests {
 
     #[test]
     fn sc_track_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeTrack, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeTrack, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 2);
     }
 
     #[test]
     fn sc_geopoint_mode() {
-        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeGeopoint, [0.0, 0.0]));
+        let sc = orion_cmd_to_sensor_control(&make_cmd(OrionMode::OrionModeGeopoint, [0.0, 0.0]), 0, 0.0);
         assert_eq!(sc.sensor_state, 4);
     }
 

@@ -17,6 +17,7 @@ use sim_core::cigi::build::{
     build_view_control, build_wire_sensor_control, make_ig_control, platform_to_entity_control,
 };
 use sim_core::cigi::host::{CigiResponse, build_datagram};
+use sim_core::cigi::messages::IgControl;
 use convert::to_cigi::orion_cmd_to_sensor_control;
 use convert::to_orion::sensor_response_to_telemetry;
 use orion::GeolocateTelemetryCorePacket;
@@ -72,10 +73,12 @@ async fn main() {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(DT));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let startup_time = Instant::now();
     let mut frame_ctr: u32 = 0;
     let mut noise_seed: u32 = 0xCAFE_BABE;
     let mut last_cmd: Option<OrionCmdPacket> = None;
     let mut last_sof: Option<Instant> = None;
+    let mut last_ig_frame_ctr: u32 = 0;
     // Most recent SensorResponse receipt. Used to suppress the synthetic
     // keepalive when the scene generator is already driving telemetry, so the
     // Orion client doesn't see interleaved lookpoints from two sources.
@@ -111,13 +114,21 @@ async fn main() {
                     // reflect the latest Orion command after slew dynamics.
                     // These are what we ship in ViewControl.
                     if let Some(ref cmd) = last_cmd {
-                        let sc_internal = orion_cmd_to_sensor_control(cmd);
+                        let sc_internal =
+                            orion_cmd_to_sensor_control(cmd, sim.camera_index, sim.zoom_level);
                         sim.apply_sensor_control(&sc_internal);
                     }
                     sim.tick(DT);
 
                     let platform = platform_rx.borrow().clone();
-                    let ig = make_ig_control(frame_ctr);
+                    // Build IgControl with the IG's most recent frame counter
+                    // (echoed back for drop detection) and host elapsed time.
+                    let ig = IgControl {
+                        last_rcvd_ig_frame_ctr: last_ig_frame_ctr as u16,
+                        timestamp_valid: true,
+                        timestamp: startup_time.elapsed().as_secs_f64(),
+                        ..make_ig_control(frame_ctr)
+                    };
                     let ec = platform_to_entity_control(&platform, PLATFORM_ENTITY_ID);
                     // ViewControl: authoritative gimbal pose + mount offsets.
                     // Uses the simulator's current (slewed) pan/tilt so the IG
@@ -161,7 +172,7 @@ async fn main() {
                 } else {
                     // ── Simulator fallback ───────────────────────────────
                     if let Some(ref cmd) = last_cmd {
-                        let sc = orion_cmd_to_sensor_control(cmd);
+                        let sc = orion_cmd_to_sensor_control(cmd, sim.camera_index, sim.zoom_level);
                         sim.apply_sensor_control(&sc);
                     }
                     sim.tick(DT);
@@ -189,8 +200,9 @@ async fn main() {
             // ── CIGI response from scene generator ───────────────────────
             Some(resp) = cigi_resp_rx.recv() => {
                 match resp {
-                    CigiResponse::StartOfFrame(_sof) => {
+                    CigiResponse::StartOfFrame(sof) => {
                         last_sof = Some(Instant::now());
+                        last_ig_frame_ctr = sof.ig_frame_ctr;
                     }
                     CigiResponse::SensorResponse(ser) => {
                         last_sensor_response = Some(Instant::now());
