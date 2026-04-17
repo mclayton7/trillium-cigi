@@ -2,8 +2,8 @@
 name = "cigi_trillium"
 version = "0.1.0"
 edition = "2024"
-# Dockerfile pins rust:1.90-bookworm for icu_* MSRV; keep this in sync so
-# local `cargo build` fails fast on older toolchains instead of in CI.
+# Minimum supported Rust — set by icu_*'s MSRV (see commit 77aaee7).
+# Production builds use rust:1.95-bookworm (latest stable) per the Dockerfile.
 rust-version = "1.90"
 
 [dependencies]
