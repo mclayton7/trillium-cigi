@@ -1,0 +1,45 @@
+# CIGI Trillium Gimbal Simulator — HD55-Mv Configuration
+#
+# Matches lucas_sdk/settings/arbitrator/appsettings.trilliumhd55Mv.json so
+# telemetry FOV agrees with what the LUCAS arbitrator expects.
+#
+# Trillium HD55 specs:
+#   EO HFOV: 41.4° (wide) – 1.4° (narrow), zoom 1× – 33.3×
+#   IR HFOV: 25.0° (wide) – 2.5° (narrow)  (datasheet typical)
+#
+# Usage: copy to config.toml (or symlink) before launching against LUCAS.
+
+[network]
+# Orion TCP listen port matches the LUCAS arbitrator's expected peer port.
+orion_listen_port         = 8747
+scene_generator_ip        = "127.0.0.1"
+scene_generator_cigi_port = 8888
+cigi_listen_port          = 8889
+
+[platform_source]
+# LUCAS drives an ArduPlane SITL over MAVLink; the static (0,0,0) default
+# yields nonsense telemetry, so default to mavlink here.
+kind = "mavlink"
+
+[platform_source.mavlink]
+listen_port = 14550
+system_id   = 0       # 0 = accept any system id
+
+[camera.eo_wide]
+hfov_wide_deg   = 41.4
+vfov_wide_deg   = 31.05   # 4:3 aspect → 31.05° VFOV
+hfov_narrow_deg = 1.4
+vfov_narrow_deg = 1.05
+
+[camera.eo_narrow]
+# HD55 does not ship a separate narrow EO sensor; mirror the zoomed-in EO.
+hfov_wide_deg   = 5.0
+vfov_wide_deg   = 3.75
+hfov_narrow_deg = 1.4
+vfov_narrow_deg = 1.05
+
+[camera.ir]
+hfov_wide_deg   = 25.0
+vfov_wide_deg   = 18.75
+hfov_narrow_deg = 2.5
+vfov_narrow_deg = 1.875
