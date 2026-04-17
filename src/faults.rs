@@ -45,6 +45,9 @@ pub struct FaultState {
     /// Frozen tilt angle captured at encoder fault injection (rad).
     pub frozen_tilt: f32,
 
+    /// Laser rangefinder fault — forces `range_source=None` and zero slant range.
+    pub laser_fault: bool,
+
     // Internal: accumulated system time (seconds) for temperature drift model.
     pub(crate) uptime_secs: f32,
 }
@@ -95,6 +98,9 @@ impl FaultState {
         self.frozen_tilt = 0.0;
     }
 
+    pub fn inject_laser_fault(&mut self) { self.laser_fault = true; }
+    pub fn clear_laser_fault(&mut self)  { self.laser_fault = false; }
+
     pub fn clear_all(&mut self)          {
         self.gps_loss = false;
         self.motor_fault = false;
@@ -105,6 +111,7 @@ impl FaultState {
         self.encoder_fault = false;
         self.frozen_pan = 0.0;
         self.frozen_tilt = 0.0;
+        self.laser_fault = false;
     }
 
     // ── Packet builders ──────────────────────────────────────────

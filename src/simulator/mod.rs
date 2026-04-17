@@ -99,7 +99,8 @@ pub struct GimbalSimulator {
     prev_track_y: f32,
 
     // ── Vibration ────────────────────────────────────────────────────
-    jitter_phase: f32, // accumulated cycles
+    jitter_phase: f32, // primary resonance accumulated cycles
+    jitter_phase_2: f32, // second resonance accumulated cycles
     noise_seed: u32,   // LCG state
     /// Instantaneous jitter added to pan for this frame's telemetry.
     pan_jitter: f32,
@@ -109,6 +110,17 @@ pub struct GimbalSimulator {
     /// the physical vibration of the sensor.
     pub pan_jittered: f32,
     pub tilt_jittered: f32,
+
+    // ── Laser rangefinder ───────────────────────────────────────────
+    /// Laser rangefinder enabled (default true). Disable via `laser_fault`.
+    pub laser_enabled: bool,
+    /// Most recent computed slant range (metres). 0.0 when no valid LOS hit.
+    pub slant_range_m: f64,
+
+    // ── Settling ────────────────────────────────────────────────────
+    /// True when in Position/Geopoint mode and both axes are within
+    /// 0.01 rad of target. Fed to CIGI `sensor_status` for Locked vs Slewing.
+    pub settled: bool,
 
     // ── Diagnostics / faults ────────────────────────────────────────
     pub faults: FaultState,
@@ -167,11 +179,15 @@ impl Default for GimbalSimulator {
             prev_track_x: 0.0,
             prev_track_y: 0.0,
             jitter_phase: 0.0,
+            jitter_phase_2: 0.0,
             noise_seed: 0xDEAD_BEEF,
             pan_jitter: 0.0,
             tilt_jitter: 0.0,
             pan_jittered: 0.0,
             tilt_jittered: 0.0,
+            laser_enabled: true,
+            slant_range_m: 0.0,
+            settled: false,
             faults: FaultState::default(),
             frame_ctr: 0,
             system_time_ms: 0,
@@ -407,12 +423,32 @@ impl GimbalSimulator {
                         &self.config.gimbal_mount,
                     );
                     self.set_target(tp, tt);
+
+                    // Coordinate pan and tilt so both arrive together, yielding
+                    // a straight-line LOS trajectory instead of L-shaped motion.
+                    // Skip coordination once either axis is within 1 mrad of its
+                    // target to avoid division by near-zero near settle.
+                    let pan_err = (self.target_pan - self.pan).abs();
+                    let tilt_err = (self.target_tilt - self.tilt).abs();
+                    let (pan_rate_lim, tilt_rate_lim) =
+                        if pan_err > 0.001 && tilt_err > 0.001 {
+                            let pan_time = pan_err / effective_slew_rate;
+                            let tilt_time = tilt_err / effective_slew_rate;
+                            let max_time = pan_time.max(tilt_time);
+                            (
+                                (pan_err / max_time).min(effective_slew_rate),
+                                (tilt_err / max_time).min(effective_slew_rate),
+                            )
+                        } else {
+                            (effective_slew_rate, effective_slew_rate)
+                        };
+
                     tick_axis_trap(
                         &mut self.pan,
                         &mut self.pan_rate,
                         self.target_pan,
                         dt,
-                        effective_slew_rate,
+                        pan_rate_lim,
                         self.config.max_accel,
                     );
                     tick_axis_trap(
@@ -420,7 +456,7 @@ impl GimbalSimulator {
                         &mut self.tilt_rate,
                         self.target_tilt,
                         dt,
-                        effective_slew_rate,
+                        tilt_rate_lim,
                         self.config.max_accel,
                     );
                 }
@@ -443,10 +479,13 @@ impl GimbalSimulator {
                         self.tilt = self.tilt.clamp(self.config.tilt_min, self.config.tilt_max);
                         self.pan_rate = pr;
                         self.tilt_rate = tr;
-                        // Track loss when target approaches FOV edge.
+                        // Track loss when target approaches FOV edge OR
+                        // computed confidence drops below the break-lock floor.
                         let threshold = self.config.track_loss_threshold;
+                        let (_size, confidence) = self.track_size_confidence();
                         if self.track_target[0].abs() > threshold
                             || self.track_target[1].abs() > threshold
+                            || confidence < 0.3
                         {
                             self.track_active = false;
                         }
@@ -467,6 +506,29 @@ impl GimbalSimulator {
             self.tilt_rate = 0.0;
         }
 
+        // ── Cross-axis gyroscopic coupling ────────────────────────
+        // Opposite-sign perturbations model first-order precession: when
+        // both axes slew simultaneously, pan and tilt see equal-magnitude
+        // but opposite angular offsets. The product term keeps the coupling
+        // dormant unless both axes are actually moving.
+        if self.config.gyro_coupling_factor != 0.0 {
+            let coupling = self.config.gyro_coupling_factor
+                * self.pan_rate
+                * self.tilt_rate
+                * dt;
+            self.pan += coupling;
+            self.tilt -= coupling;
+        }
+
+        // ── Settled detection ─────────────────────────────────────
+        self.settled = matches!(
+            self.mode,
+            OrionMode::OrionModePosition
+                | OrionMode::OrionModeGeopoint
+                | OrionMode::OrionModePositionNoLimits
+        ) && (self.pan - self.target_pan).abs() < 0.01
+          && (self.tilt - self.target_tilt).abs() < 0.01;
+
         // ── Vibration & jitter ────────────────────────────────────
         self.jitter_phase =
             (self.jitter_phase + self.config.jitter_freq * dt) % 1.0;
@@ -475,10 +537,17 @@ impl GimbalSimulator {
         let sinusoidal = amp * (self.jitter_phase * 2.0 * PI).sin();
         let n1 = lcg_noise_f32(&mut self.noise_seed) * self.config.noise_floor;
         let n2 = lcg_noise_f32(&mut self.noise_seed) * self.config.noise_floor;
-        self.pan_jitter = sinusoidal + n1;
+        // Second structural resonance (fixed amplitude, not slew-dependent).
+        self.jitter_phase_2 =
+            (self.jitter_phase_2 + self.config.jitter_freq_2 * dt) % 1.0;
+        let amp2 = self.config.jitter_amplitude_2;
+        let sin2_pan = amp2 * (self.jitter_phase_2 * 2.0 * PI).sin();
+        let sin2_tilt = amp2 * ((self.jitter_phase_2 + 0.25) * 2.0 * PI).sin();
+
+        self.pan_jitter = sinusoidal + sin2_pan + n1;
         // Tilt jitter is correlated but at a 90° phase offset for realism.
         let tilt_sin = amp * ((self.jitter_phase + 0.25) * 2.0 * PI).sin();
-        self.tilt_jitter = tilt_sin + n2;
+        self.tilt_jitter = tilt_sin + sin2_tilt + n2;
 
         // Store jitter-perturbed angles for look-point and telemetry.
         self.pan_jittered = self.pan + self.pan_jitter;
@@ -498,6 +567,17 @@ impl GimbalSimulator {
             self.look_lat = ll;
             self.look_lon = lo;
             self.look_alt = la;
+
+            // Slant range = Euclidean distance from platform to look-point in ECEF.
+            let [px, py, pz] =
+                geo::geodetic_to_ecef(self.pos_lat, self.pos_lon, self.pos_alt);
+            let [lx, ly, lz] = geo::geodetic_to_ecef(ll, lo, la);
+            let dx = lx - px;
+            let dy = ly - py;
+            let dz = lz - pz;
+            self.slant_range_m = (dx * dx + dy * dy + dz * dz).sqrt();
+        } else {
+            self.slant_range_m = 0.0;
         }
 
         // ── Timing ───────────────────────────────────────────────
@@ -667,13 +747,27 @@ impl GimbalSimulator {
             &self.config.gimbal_mount,
         );
 
-        // Track data.
+        // Range source. Use the laser when it is healthy and the current
+        // slant range is within the configured maximum range.
+        if self.laser_enabled
+            && !self.faults.laser_fault
+            && self.slant_range_m > 0.0
+            && self.slant_range_m <= self.config.laser_max_range_m
+        {
+            pkt.range_source = crate::orion::RangeDataSrc::RangeSrcLaser;
+        } else {
+            pkt.range_source = crate::orion::RangeDataSrc::RangeSrcNone;
+        }
+
+        // Track data. Size and confidence scale with slant range, FOV, and
+        // how close the target is to the FOV edge.
         if matches!(self.mode, OrionMode::OrionModeTrack) {
             pkt.has_track_data = 1;
+            let (size, confidence) = self.track_size_confidence();
             pkt.primary_track_data = Some(PrimaryTrackData {
                 pos: self.track_target,
-                size: 0.05,
-                confidence: if self.track_active { 0.9 } else { 0.0 },
+                size,
+                confidence: if self.track_active { confidence } else { 0.0 },
                 coasting: if self.track_active { 0 } else { 1 },
                 active: self.track_active as u32,
             });
@@ -682,14 +776,43 @@ impl GimbalSimulator {
         pkt
     }
 
+    /// Compute dynamic track size (fraction of FOV) and confidence [0..1] based
+    /// on slant range, current HFOV, target size, and offset from FOV centre.
+    fn track_size_confidence(&self) -> (f32, f32) {
+        let hfov = self.hfov.max(1e-6);
+        let angular_size = if self.slant_range_m > 0.0 {
+            (self.config.track_target_size_m as f64 / self.slant_range_m) as f32
+        } else {
+            // No valid range — fall back to a nominal 0.5° target so we still
+            // emit a plausible, non-zero size.
+            0.5_f32.to_radians()
+        };
+        let size = (angular_size / hfov).clamp(0.01, 0.5);
+
+        let offset_mag = self.track_target[0].hypot(self.track_target[1]);
+        let threshold = self.config.track_loss_threshold.max(1e-6);
+        let offset_fraction = (offset_mag / threshold).clamp(0.0, 1.0);
+
+        let min_resolvable = hfov * 0.005;
+        let size_factor = (angular_size / min_resolvable).clamp(0.0, 1.0);
+
+        let confidence = 0.95 * (1.0 - offset_fraction.powi(2)) * size_factor;
+        (size, confidence.clamp(0.0, 1.0))
+    }
+
     /// Build a CIGI SensorExtendedResponse from current state.
     ///
     /// `entity_lat/lon/alt` fields are populated with the WGS84 look-point
     /// (where the gimbal LOS intersects the Earth), not the platform position.
     pub fn to_sensor_extended_response(&self) -> SensorExtendedResponse {
         let telem = self.to_telemetry();
-        let mut resp =
-            crate::convert::to_cigi::telemetry_to_sensor_extended_response(&telem, 0, 0);
+        let mut resp = crate::convert::to_cigi::telemetry_to_sensor_extended_response(
+            &telem,
+            0,
+            0,
+            self.settled,
+            self.track_active,
+        );
 
         // Override entity position with computed look-point.
         // During camera switch blackout, report NaN-equivalent (0,0,0).
@@ -703,6 +826,28 @@ impl GimbalSimulator {
             resp.entity_lon = 0.0;
             resp.entity_alt = 0.0;
         }
+
+        // Gate size derived from FOV and configured tracking gate angular size.
+        const SENSOR_RESOLUTION: u16 = 640;
+        let hfov_deg = self.hfov.to_degrees().max(1e-6);
+        let gate_px = (self.config.track_gate_size_deg / hfov_deg
+            * SENSOR_RESOLUTION as f32) as u16;
+        let gate_px = gate_px.clamp(1, SENSOR_RESOLUTION);
+        resp.gate_x_size = gate_px;
+        resp.gate_y_size = gate_px;
+
+        // Per CIGI v3.3, gate_x_pos/gate_y_pos are the image-plane tracking gate
+        // centroid position, not gimbal pan/tilt. In track mode they follow the
+        // fractional track target offsets; in all other modes the gate is
+        // bore-sighted.
+        if self.mode == OrionMode::OrionModeTrack {
+            resp.gate_x_pos = self.track_target[0];
+            resp.gate_y_pos = self.track_target[1];
+        } else {
+            resp.gate_x_pos = 0.0;
+            resp.gate_y_pos = 0.0;
+        }
+
         resp
     }
 
@@ -818,10 +963,15 @@ mod tests {
         for _ in 0..100 {
             sim.tick(0.1);
         }
+        // Pan target was 0.5π rad ≈ 90°; tilt target was 0 rad. In position mode
+        // the gate is bore-sighted — verify the actual gimbal angles directly.
+        assert!((sim.pan - 0.5 * std::f32::consts::PI).abs() < 0.05, "sim.pan={}", sim.pan);
+        assert!(sim.tilt.abs() < 0.05, "sim.tilt={}", sim.tilt);
         let sr = sim.to_sensor_extended_response();
-        // Pan target was 0.5π rad ≈ 90°; tilt target was 0 rad.
-        assert!((sr.gate_x_pos - 90.0).abs() < 1.0, "gate_x_pos={}", sr.gate_x_pos);
-        assert!(sr.gate_y_pos.abs() < 1.0, "gate_y_pos={}", sr.gate_y_pos);
+        // Per CIGI v3.3, gate_x/y_pos are image-plane centroids, not pan/tilt.
+        // Bore-sighted (0.0) outside track mode.
+        assert_eq!(sr.gate_x_pos, 0.0);
+        assert_eq!(sr.gate_y_pos, 0.0);
     }
 
     #[test]
@@ -1095,7 +1245,9 @@ mod tests {
         let mut sim = GimbalSimulator::default();
         sim.mode = OrionMode::OrionModeTrack;
         sim.track_active = true;
-        sim.track_target = [0.4, 0.0]; // below 0.45
+        // Offset well below both the 0.45 FOV-edge threshold and the
+        // 0.3 confidence floor (dynamic confidence model).
+        sim.track_target = [0.2, 0.0];
 
         sim.tick(0.02);
 
@@ -1152,18 +1304,19 @@ mod tests {
 
     #[test]
     fn track_mode_configurable_loss_threshold() {
-        // With a higher threshold, an offset of 0.46 should NOT cause track loss.
+        // With a higher threshold, an offset of 0.3 should NOT cause track
+        // loss (0.3 < 0.5 threshold AND dynamic confidence stays above 0.3).
         let mut cfg = Config::default();
         cfg.track_loss_threshold = 0.5;
         let mut sim = GimbalSimulator::with_config(cfg);
         sim.mode = OrionMode::OrionModeTrack;
         sim.track_active = true;
-        sim.track_target = [0.46, 0.0];
+        sim.track_target = [0.3, 0.0];
 
         sim.tick(0.02);
         assert!(sim.track_active, "track should stay active with higher threshold");
 
-        // With a lower threshold, an offset of 0.3 should cause track loss.
+        // With a lower threshold, an offset of 0.3 exceeds it → track loss.
         let mut cfg2 = Config::default();
         cfg2.track_loss_threshold = 0.25;
         let mut sim2 = GimbalSimulator::with_config(cfg2);
@@ -1574,5 +1727,255 @@ mod tests {
             "thermal throttle rate mode: pan_rate={} should be near half_max={}",
             sim.pan_rate, half_max
         );
+    }
+
+    // ── Gyroscopic coupling ────────────────────────────────────────────────
+
+    #[test]
+    fn gyro_coupling_zero_factor_no_effect() {
+        let mut cfg = Config::default();
+        cfg.gyro_coupling_factor = 0.0;
+        cfg.jitter_amplitude = 0.0;
+        cfg.jitter_amplitude_2 = 0.0;
+        cfg.noise_floor = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg.clone());
+        sim.mode = OrionMode::OrionModeRate;
+        sim.pan_rate_cmd = 0.5;
+        sim.tilt_rate_cmd = 0.3;
+        for _ in 0..10 {
+            sim.tick(0.02);
+        }
+        let pan_baseline = sim.pan;
+        let tilt_baseline = sim.tilt;
+
+        let mut sim2 = GimbalSimulator::with_config(cfg);
+        sim2.mode = OrionMode::OrionModeRate;
+        sim2.pan_rate_cmd = 0.5;
+        sim2.tilt_rate_cmd = 0.3;
+        for _ in 0..10 {
+            sim2.tick(0.02);
+        }
+        assert!((sim2.pan - pan_baseline).abs() < 1e-8);
+        assert!((sim2.tilt - tilt_baseline).abs() < 1e-8);
+    }
+
+    #[test]
+    fn gyro_coupling_one_axis_zero_no_effect() {
+        let mut cfg = Config::default();
+        cfg.gyro_coupling_factor = 0.5;
+        cfg.jitter_amplitude = 0.0;
+        cfg.jitter_amplitude_2 = 0.0;
+        cfg.noise_floor = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg.clone());
+        sim.mode = OrionMode::OrionModeRate;
+        sim.pan_rate_cmd = 0.5;
+        sim.tilt_rate_cmd = 0.0;
+
+        let mut sim_no = {
+            let mut c = cfg.clone();
+            c.gyro_coupling_factor = 0.0;
+            GimbalSimulator::with_config(c)
+        };
+        sim_no.mode = OrionMode::OrionModeRate;
+        sim_no.pan_rate_cmd = 0.5;
+        sim_no.tilt_rate_cmd = 0.0;
+
+        for _ in 0..50 {
+            sim.tick(0.02);
+            sim_no.tick(0.02);
+        }
+        assert!((sim.pan - sim_no.pan).abs() < 1e-8);
+        assert!((sim.tilt - sim_no.tilt).abs() < 1e-8);
+    }
+
+    #[test]
+    fn gyro_coupling_opposite_signs() {
+        // When both axes slew, the coupling pushes pan and tilt by the same
+        // magnitude with opposite signs (genuine cross-axis perturbation).
+        let mut cfg_base = Config::default();
+        cfg_base.jitter_amplitude = 0.0;
+        cfg_base.jitter_amplitude_2 = 0.0;
+        cfg_base.noise_floor = 0.0;
+        cfg_base.gyro_coupling_factor = 0.0;
+        let mut sim_base = GimbalSimulator::with_config(cfg_base);
+        sim_base.mode = OrionMode::OrionModeRate;
+        sim_base.pan_rate_cmd = 0.5;
+        sim_base.tilt_rate_cmd = 0.3;
+        for _ in 0..50 { sim_base.tick(0.02); }
+
+        let mut cfg_c = Config::default();
+        cfg_c.jitter_amplitude = 0.0;
+        cfg_c.jitter_amplitude_2 = 0.0;
+        cfg_c.noise_floor = 0.0;
+        cfg_c.gyro_coupling_factor = 0.1;
+        let mut sim_c = GimbalSimulator::with_config(cfg_c);
+        sim_c.mode = OrionMode::OrionModeRate;
+        sim_c.pan_rate_cmd = 0.5;
+        sim_c.tilt_rate_cmd = 0.3;
+        for _ in 0..50 { sim_c.tick(0.02); }
+
+        let pan_diff = sim_c.pan - sim_base.pan;
+        let tilt_diff = sim_c.tilt - sim_base.tilt;
+        assert!(pan_diff.abs() > 1e-6, "pan diff should be non-zero: {}", pan_diff);
+        // Opposite signs — pan_diff ≈ −tilt_diff.
+        assert!((pan_diff + tilt_diff).abs() < 1e-6,
+            "expected opposite-sign coupling: pan_diff={}, tilt_diff={}",
+            pan_diff, tilt_diff);
+    }
+
+    // ── Multi-frequency jitter ─────────────────────────────────────────────
+
+    #[test]
+    fn second_jitter_frequency_nonzero() {
+        let mut cfg = Config::default();
+        // Disable the primary and noise; keep only the secondary resonance.
+        cfg.jitter_amplitude = 0.0;
+        cfg.noise_floor = 0.0;
+        cfg.jitter_amplitude_2 = 0.01;
+        cfg.jitter_freq_2 = 47.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.tick(0.02);
+        assert!(sim.pan_jitter != 0.0 || sim.tilt_jitter != 0.0);
+    }
+
+    // ── Coordinated geopoint slew ──────────────────────────────────────────
+
+    #[test]
+    fn geopoint_axes_arrive_together() {
+        // With coordinated rates both axes should cross their target windows
+        // within a few ticks of each other even when one needs a much larger
+        // angular travel. Use a geopoint that requires a large pan swing and a
+        // small tilt delta relative to the platform's initial LOS.
+        let mut cfg = Config::default();
+        cfg.platform_alt = 1000.0;
+        cfg.jitter_amplitude = 0.0;
+        cfg.jitter_amplitude_2 = 0.0;
+        cfg.noise_floor = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.mode = OrionMode::OrionModeGeopoint;
+        sim.pos_alt = 1000.0;
+        // Target ~5 km east of origin so pan swings hard but tilt is modest.
+        sim.geopoint_lat = 0.0;
+        sim.geopoint_lon = 5_000.0 / 6_378_000.0; // ~5 km east in radians
+        sim.geopoint_alt = 0.0;
+
+        let mut pan_settled = None;
+        let mut tilt_settled = None;
+        for i in 0..400 {
+            sim.tick(0.02);
+            if pan_settled.is_none() && (sim.pan - sim.target_pan).abs() < 0.01 {
+                pan_settled = Some(i);
+            }
+            if tilt_settled.is_none() && (sim.tilt - sim.target_tilt).abs() < 0.01 {
+                tilt_settled = Some(i);
+            }
+        }
+        let pan_i = pan_settled.expect("pan should settle");
+        let tilt_i = tilt_settled.expect("tilt should settle");
+        // Without coordination the slower axis would settle much earlier; with
+        // coordination the two converge within ~50 ticks of each other.
+        assert!((pan_i as i32 - tilt_i as i32).abs() < 50,
+            "axes should arrive together: pan={}, tilt={}", pan_i, tilt_i);
+    }
+
+    // ── Laser rangefinder ──────────────────────────────────────────────────
+
+    #[test]
+    fn laser_produces_slant_range() {
+        // Park the gimbal looking straight down from 1000 m and let one tick
+        // recompute the look-point + slant range.
+        let mut sim = GimbalSimulator::default();
+        sim.pos_alt = 1000.0;
+        sim.mode = OrionMode::OrionModeDisabled;
+        sim.tilt = (90.0_f32).to_radians(); // +90° = nadir (looking straight down)
+        sim.tick(0.02);
+        assert!(sim.slant_range_m > 100.0,
+            "slant_range_m should be ≈1000 m when looking down from 1000 m, got {}",
+            sim.slant_range_m);
+        let telem = sim.to_telemetry();
+        assert!(matches!(telem.range_source, crate::orion::RangeDataSrc::RangeSrcLaser));
+    }
+
+    #[test]
+    fn laser_fault_disables_range_source() {
+        let mut sim = GimbalSimulator::default();
+        sim.pos_alt = 1000.0;
+        sim.mode = OrionMode::OrionModeDisabled;
+        sim.tilt = (90.0_f32).to_radians(); // +90° = nadir (looking straight down)
+        sim.tick(0.02);
+        sim.faults.inject_laser_fault();
+        let telem = sim.to_telemetry();
+        assert!(matches!(telem.range_source, crate::orion::RangeDataSrc::RangeSrcNone));
+    }
+
+    // ── FOV-derived gate size ─────────────────────────────────────────────
+
+    #[test]
+    fn gate_size_scales_with_fov() {
+        let mut cfg = Config::default();
+        cfg.track_gate_size_deg = 1.0;
+        let mut sim_wide = GimbalSimulator::with_config(cfg.clone());
+        sim_wide.zoom_level = 0.0;
+        let (h, v) = sim_wide.config.fov_at_zoom_for_camera(0, 0.0);
+        sim_wide.hfov = h; sim_wide.vfov = v;
+        let gate_wide = sim_wide.to_sensor_extended_response().gate_x_size;
+
+        let mut sim_narrow = GimbalSimulator::with_config(cfg);
+        sim_narrow.zoom_level = 1.0;
+        let (h, v) = sim_narrow.config.fov_at_zoom_for_camera(0, 1.0);
+        sim_narrow.hfov = h; sim_narrow.vfov = v;
+        let gate_narrow = sim_narrow.to_sensor_extended_response().gate_x_size;
+
+        // Narrower FOV → same angular gate occupies a larger fraction → more
+        // pixels.
+        assert!(gate_narrow > gate_wide,
+            "narrow gate px ({}) should exceed wide gate px ({})",
+            gate_narrow, gate_wide);
+    }
+
+    // ── Gate position spec compliance ─────────────────────────────────────
+
+    #[test]
+    fn gate_pos_zero_outside_track_mode() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.pan = 0.5;
+        sim.tilt = -0.3;
+        let r = sim.to_sensor_extended_response();
+        assert_eq!(r.gate_x_pos, 0.0);
+        assert_eq!(r.gate_y_pos, 0.0);
+    }
+
+    #[test]
+    fn gate_pos_follows_track_target() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModeTrack;
+        sim.track_active = true;
+        sim.track_target = [0.12, -0.08];
+        let r = sim.to_sensor_extended_response();
+        assert!((r.gate_x_pos - 0.12).abs() < 1e-6);
+        assert!((r.gate_y_pos - (-0.08)).abs() < 1e-6);
+    }
+
+    // ── Settled flag ──────────────────────────────────────────────────────
+
+    #[test]
+    fn settled_flag_set_when_converged() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 0.0;
+        sim.target_tilt = 0.0;
+        sim.tick(0.02);
+        assert!(sim.settled);
+    }
+
+    #[test]
+    fn settled_flag_false_while_slewing() {
+        let mut sim = GimbalSimulator::default();
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_pan = 1.0;
+        sim.target_tilt = 0.0;
+        sim.tick(0.02);
+        assert!(!sim.settled);
     }
 }

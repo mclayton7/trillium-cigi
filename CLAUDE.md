@@ -2,9 +2,10 @@
 
 ```bash
 cargo build --release      # also runs build.rs codegen
-cargo test                 # ~110 tests across cigi, orion, simulator, convert, config, faults
+cargo test                 # ~125 tests across cigi, orion, simulator, convert, config, faults
 cargo run                  # uses ./config.toml if present; built-in defaults otherwise
 cargo run -- --diag        # enable 1 Hz diagnostics log
+cargo test <test_name>     # run a single test by name, e.g. cargo test slew_toward_target
 ```
 
 Default ports when no `config.toml` is loaded: Trillium TCP :8008, CIGI send :8100, CIGI recv :8101.
@@ -67,9 +68,33 @@ Geo (WGS84 / ECEF / NED / ray-cast), CIGI wire structs + build helpers, and plat
 **SensorControl field mapping** (non-obvious CIGI extension):
 - `sensor_state` 4 → Geopoint mode (not in base CIGI v3.3 spec); uses bit 2, overlapping polarity flag
 - `track_mode` bit 0 → Rate vs Position when `sensor_state=1`
-- `ac_coupling` → zoom level (Position/Rate) or geopoint lat (Geopoint)
+- `sensor_id` → camera index (0=EO wide, 1=EO narrow, 2=IR); forwarded by `orion_cmd_to_sensor_control` to the internal simulator path
+- `ac_coupling` → zoom level (Position/Rate) or geopoint lat (Geopoint); forwarded by `orion_cmd_to_sensor_control`
 - `noise` → geopoint lon fraction (Geopoint mode only)
+
+**CIGI gate_x_pos/gate_y_pos:** These fields carry the image-plane tracking gate centroid position (CIGI v3.3 spec-compliant), NOT gimbal pan/tilt angles. In track mode they equal `track_target[0]/[1]`; in all other modes they are 0.0 (bore-sighted). Pan/tilt are only available via the Orion TCP telemetry path.
 
 **Camera switch blackout:** `entity_lat/lon/alt` returns 0,0,0 for 200 ms (10 frames at the 50 Hz tick rate) after a camera switch. Tests must account for this.
 
 **Continuous pan:** `pan_limit_deg = 360` enables unlimited rotation. Shortest-path algorithm is used; reported angle wraps to (−180°, 180°].
+
+**Sensor status mapping** (`orion_mode_to_sensor_status`, receives `settled` + `track_active`):
+- Position/Geopoint settled (error < 0.01 rad on both axes) → 0 (Locked)
+- Position/Geopoint slewing → 2 (Slewing)
+- Rate mode → 2 (Slewing)
+- Track mode with `track_active = true` → 1 (Tracking)
+- Track mode with `track_active = false` (coasting/lost), Disabled, Fault → 3 (Breaklock)
+
+**Coordinated geopoint slew:** In geopoint mode, pan/tilt axes are coordinated so both arrive on target simultaneously (straight-line LOS). The faster axis rate is proportionally reduced; once either axis is within 1 mrad of its target the guard skips coordination to avoid divide-by-zero near settle.
+
+**Track loss triggers:** Two independent conditions cause track loss: (1) target offset exceeds `track_loss_threshold` fraction of FOV, or (2) dynamic confidence drops below 0.3. Confidence comes from `track_size_confidence()` and depends on slant range, target size, FOV, and offset.
+
+**Laser rangefinder:** `slant_range_m` is recomputed each tick from the current look-point (ECEF Euclidean distance). `range_source` is set to `RangeSrcLaser` when `laser_enabled` is true, `laser_fault` is clear, and the range is within `laser_max_range_m`; otherwise `RangeSrcNone`.
+
+**Cross-axis gyroscopic coupling:** Opposite-sign model: `pan += k·pan_rate·tilt_rate·dt`, `tilt -= k·pan_rate·tilt_rate·dt`. Dormant unless both axes are moving (product is zero). `gyro_coupling_factor = 0` disables the model entirely.
+
+**Multi-frequency jitter:** Two sinusoidal resonances (default 10 Hz and 47 Hz) are summed with white noise. Non-harmonic frequencies produce realistic beat patterns; the second resonance has fixed amplitude (not slew-dependent).
+
+**Thermal throttling:** When `thermal_warning` fault is active, effective `max_slew_rate` is halved.
+
+**GPS fault packet uses `FaultTypeNone`** — the Orion protocol XML defines no GPS-specific fault type. `FaultTypeNone + FaultLevelWarning` is the convention. Update if a GPS fault type is added to the XML.
