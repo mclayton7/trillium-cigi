@@ -515,11 +515,17 @@ impl GimbalSimulator {
         }
 
         // ── Cross-axis gyroscopic coupling ──────────────────────────
+        // Opposite-sign perturbations model first-order precession: when
+        // both axes slew simultaneously, pan and tilt see equal-magnitude
+        // but opposite angular offsets. The product term keeps the coupling
+        // dormant unless both axes are actually moving.
         if self.config.gyro_coupling_factor != 0.0 {
-            let pan_coupling = self.config.gyro_coupling_factor * self.tilt_rate * self.pan_rate * dt_secs as f32;
-            let tilt_coupling = self.config.gyro_coupling_factor * self.pan_rate * self.tilt_rate * dt_secs as f32;
-            self.pan += pan_coupling;
-            self.tilt += tilt_coupling;
+            let coupling = self.config.gyro_coupling_factor
+                * self.pan_rate
+                * self.tilt_rate
+                * dt_secs as f32;
+            self.pan += coupling;
+            self.tilt -= coupling;
         }
 
         // ── Settled detection ──────────────────────────────────────
@@ -798,8 +804,13 @@ impl GimbalSimulator {
     /// (where the gimbal LOS intersects the Earth), not the platform position.
     pub fn to_sensor_extended_response(&self) -> SensorExtendedResponse {
         let telem = self.to_telemetry();
-        let mut resp =
-            crate::convert::to_cigi::telemetry_to_sensor_extended_response(&telem, 0, 0, self.settled);
+        let mut resp = crate::convert::to_cigi::telemetry_to_sensor_extended_response(
+            &telem,
+            0,
+            0,
+            self.settled,
+            self.track_active,
+        );
 
         // Override entity position with computed look-point.
         // During camera switch blackout, report NaN-equivalent (0,0,0).

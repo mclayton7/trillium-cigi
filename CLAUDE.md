@@ -98,7 +98,7 @@ Trillium Controller ↕ TCP (Orion big-endian) :8008
 
 **CIGI gate_x_pos/gate_y_pos:** These fields carry the image-plane tracking gate centroid position (CIGI v3.3 spec-compliant), NOT gimbal pan/tilt angles. In track mode they equal `track_target[0]/[1]`; in all other modes they are 0.0 (bore-sighted). Pan/tilt are only available via the Orion TCP telemetry path.
 
-**Camera switch blackout:** `entity_lat/lon/alt` returns 0,0,0 for 200 ms (10 frames at 20 Hz) after a camera switch. Tests must account for this.
+**Camera switch blackout:** `entity_lat/lon/alt` returns 0,0,0 for 200 ms (10 frames at the 50 Hz tick rate) after a camera switch. Tests must account for this.
 
 **Continuous pan:** `pan_limit_deg = 360` enables unlimited rotation. Shortest-path algorithm is used; reported angle wraps to (−180°, 180°].
 
