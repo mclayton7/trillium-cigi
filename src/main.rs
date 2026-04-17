@@ -30,6 +30,10 @@ const PLATFORM_ENTITY_ID: u16 = 1;
 const SENSOR_VIEW_ID: u16 = 1;
 /// Tick interval (50 Hz).
 const DT: f64 = 0.02;
+/// Number of discrete CIGI FOV presets advertised on the wire (matches the IG).
+const WIRE_PRESET_COUNT: u8 = 3;
+/// How fresh a SensorResponse must be before we suppress the synthetic-telemetry keepalive.
+const SR_KEEPALIVE_STALE: Duration = Duration::from_millis(200);
 
 #[tokio::main]
 async fn main() {
@@ -72,6 +76,10 @@ async fn main() {
     let mut noise_seed: u32 = 0xCAFE_BABE;
     let mut last_cmd: Option<OrionCmdPacket> = None;
     let mut last_sof: Option<Instant> = None;
+    // Most recent SensorResponse receipt. Used to suppress the synthetic
+    // keepalive when the scene generator is already driving telemetry, so the
+    // Orion client doesn't see interleaved lookpoints from two sources.
+    let mut last_sensor_response: Option<Instant> = None;
 
     println!(
         "CIGI Trillium Bridge — Trillium TCP :{} | CIGI UDP :{} → {}:{}",
@@ -121,23 +129,31 @@ async fn main() {
                         SENSOR_VIEW_ID,
                         PLATFORM_ENTITY_ID,
                     );
-                    // SensorControl on the wire: only camera selection + FOV
-                    // preset (via Gain). Zoom command plumbing from Orion is
-                    // future work — always send preset 0 (widest) for now.
-                    // The scene generator reads Gain as preset index; sending
-                    // a pan-derived value (old behavior) caused wild FOV jumps.
+                    // SensorControl on the wire: camera selection + FOV preset
+                    // (via Gain). The scene generator reads Gain as a preset
+                    // index; zoom_level ∈ [0,1] maps uniformly onto the
+                    // WIRE_PRESET_COUNT-many presets.
+                    let preset_index = ((sim.zoom_level.clamp(0.0, 1.0)
+                        * WIRE_PRESET_COUNT as f32) as u8)
+                        .min(WIRE_PRESET_COUNT - 1);
                     let sc_wire = build_wire_sensor_control(
                         sim.camera_index.max(0) as u8,
                         SENSOR_VIEW_ID as u8,
-                        0,
-                        3,
+                        preset_index,
+                        WIRE_PRESET_COUNT,
                     );
                     let datagram = build_datagram(&ig, &ec, Some(&vc), Some(&sc_wire));
                     cigi_send_tx.try_send(datagram).ok();
 
-                    // Emit synthetic telemetry so the Orion Controller keeps
-                    // seeing fresh look-point data while the IG path is up.
-                    if frame_ctr % 5 == 0 {
+                    // Synthetic telemetry acts as a keepalive only when the
+                    // scene generator isn't currently producing SensorResponse
+                    // frames. If a real response arrived within
+                    // SR_KEEPALIVE_STALE, skip — the SR arm below is already
+                    // forwarding authoritative telemetry.
+                    let sr_fresh = last_sensor_response
+                        .map(|t| t.elapsed() < SR_KEEPALIVE_STALE)
+                        .unwrap_or(false);
+                    if frame_ctr % 5 == 0 && !sr_fresh {
                         let ser = sim.to_sensor_extended_response();
                         let telem = sensor_response_to_telemetry(&ser, &platform);
                         orion_telem_tx.try_send(telem).ok();
@@ -177,6 +193,7 @@ async fn main() {
                         last_sof = Some(Instant::now());
                     }
                     CigiResponse::SensorResponse(ser) => {
+                        last_sensor_response = Some(Instant::now());
                         let platform = platform_rx.borrow().clone();
                         let telem = sensor_response_to_telemetry(&ser, &platform);
                         orion_telem_tx.try_send(telem).ok();
