@@ -7,13 +7,13 @@
 #   LWIR:  29° – 3° HFOV (10× zoom)
 #   Power: 24 VDC, 15 W avg / 75 W peak
 #
-# Usage: rename to config.toml, or extend main.rs to accept --config <path>.
+# Usage: copy to config.toml, or extend main.rs to accept --config <path>.
 #
 # NOTE: pan_limit_deg = 360 disables the hard-stop clamp (continuous rotation).
 # The simulator treats any value >= 360 as unlimited pan.
 
 [network]
-port = 8008
+orion_listen_port = 8008
 
 [kinematics]
 # Slew rate unspecified in HD45 datasheet — placeholder, tune to measured hardware.
@@ -24,25 +24,27 @@ pan_limit_deg       = 360.0
 tilt_min_deg        = -80.0
 tilt_max_deg        = 42.0
 
-[camera]
 # Per-camera FOV (wide = zoom 0, narrow = zoom 1).
+[camera.eo_wide]
 # Camera 0: EO (46.8° – 1.2° HFOV, 40× zoom)
-camera_0_hfov_wide_deg   = 46.8
-camera_0_vfov_wide_deg   = 35.1
-camera_0_hfov_narrow_deg = 1.2
-camera_0_vfov_narrow_deg = 0.9
+hfov_wide_deg   = 46.8
+vfov_wide_deg   = 35.1
+hfov_narrow_deg = 1.2
+vfov_narrow_deg = 0.9
 
+[camera.eo_narrow]
 # Camera 1: EO narrow (same sensor, fixed narrow preset)
-camera_1_hfov_wide_deg   = 5.0
-camera_1_vfov_wide_deg   = 3.75
-camera_1_hfov_narrow_deg = 1.2
-camera_1_vfov_narrow_deg = 0.9
+hfov_wide_deg   = 5.0
+vfov_wide_deg   = 3.75
+hfov_narrow_deg = 1.2
+vfov_narrow_deg = 0.9
 
+[camera.ir]
 # Camera 2: LWIR (29° – 3° HFOV, 10× zoom)
-camera_2_hfov_wide_deg   = 29.0
-camera_2_vfov_wide_deg   = 21.75
-camera_2_hfov_narrow_deg = 3.0
-camera_2_vfov_narrow_deg = 2.25
+hfov_wide_deg   = 29.0
+vfov_wide_deg   = 21.75
+hfov_narrow_deg = 3.0
+vfov_narrow_deg = 2.25
 
 [vibration]
 # HD45 spec: 1.5° typical total system accuracy — model as moderate jitter.

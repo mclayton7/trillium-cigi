@@ -2,6 +2,9 @@
 name = "cigi_trillium"
 version = "0.1.0"
 edition = "2024"
+# Minimum supported Rust — set by icu_*'s MSRV (see commit 77aaee7).
+# Production builds use rust:1.95-bookworm (latest stable) per the Dockerfile.
+rust-version = "1.90"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
