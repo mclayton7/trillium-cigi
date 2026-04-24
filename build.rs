@@ -8,7 +8,11 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
+    // Declaring any rerun-if-changed line opts us out of Cargo's default
+    // "rerun on any source change" rule, so list every input the codegen
+    // depends on — both the schema and the generator itself.
     println!("cargo:rerun-if-changed=OrionPublicProtocol.xml");
+    println!("cargo:rerun-if-changed=build.rs");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let xml_path = Path::new(&manifest_dir).join("OrionPublicProtocol.xml");
     let xml = fs::read_to_string(&xml_path).expect("Cannot read OrionPublicProtocol.xml");
@@ -248,12 +252,20 @@ fn parse_in_mem(s: &str) -> (Option<String>, Option<u8>, bool) {
         "bitfield1" => (Some("bool".into()), Some(1), false),
         "null" => (None, None, true),
         s if s.starts_with("bitfield") => {
-            let n: u8 = s[8..].parse().unwrap_or(1);
+            let n: u8 = s[8..]
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid bitfield width in inMemoryType: {s:?}"));
             (Some("u8".into()), Some(n), false)
         }
         // Treat string types as null — not needed by the simulator.
         "string" | "fixedstring" => (None, None, true),
-        _ => (Some("u8".into()), None, false),
+        // Surface schema drift loudly: an unknown inMemoryType used to silently
+        // become a u8, which produced a packet that compiled but was wrong on
+        // the wire. Prefer a build-time error so new types must be added here
+        // explicitly.
+        other => panic!(
+            "unknown inMemoryType {other:?} — add a branch to parse_in_mem in build.rs"
+        ),
     }
 }
 
@@ -268,13 +280,29 @@ fn parse_enc(s: &str) -> (Option<String>, Option<u8>) {
         "signed16" => (Some("i16".into()), None),
         "signed24" | "signed32" => (Some("i32".into()), None),
         "float" | "float32" => (Some("f32".into()), None),
-        "float64" => (Some("f64".into()), None),
         "null" => (None, None),
+        // IEEE half-precision is referenced by some diagnostic packets
+        // (InsQuality / *ChiSquare) but the generator has no half-precision
+        // encode/decode path. Treat as `null` (skip on the wire) and emit a
+        // cargo warning so the gap stays visible until proper support is
+        // added — silently mapping to u8 (the previous behaviour) corrupted
+        // the byte stream for any consumer that did parse these packets.
+        "float16" => {
+            println!(
+                "cargo:warning=encodedType \"float16\" is not implemented; \
+                 affected fields are skipped in the generated codec"
+            );
+            (None, None)
+        }
         s if s.starts_with("bitfield") => {
-            let n: u8 = s[8..].parse().unwrap_or(1);
+            let n: u8 = s[8..]
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid bitfield width in encodedType: {s:?}"));
             (None, Some(n))
         }
-        _ => (Some("u8".into()), None),
+        other => panic!(
+            "unknown encodedType {other:?} — add a branch to parse_enc in build.rs"
+        ),
     }
 }
 
@@ -655,6 +683,18 @@ fn encode_elem(
     if byte_count == 1 {
         writeln!(out, "        out.push(({}) as u8);", cast_expr).ok();
     } else if enc == "f32" || enc == "f64" {
+        // Float-to-float encoding writes the raw value — no integer-style
+        // scaler/clamp can be applied here meaningfully. The integer scale
+        // formulas in `cast_expr` clamp to i32/u32 ranges, which would
+        // truncate a float silently, so reject scaled float-to-float fields
+        // at codegen time rather than silently dropping the scale.
+        if !matches!(f.scale, ScaleKind::None) {
+            panic!(
+                "field {:?}: scale on float-to-{} encoding is not supported \
+                 (the generator would silently drop the scaler)",
+                f.rust_name, enc
+            );
+        }
         writeln!(
             out,
             "        out.extend_from_slice(&({} as {}).to_be_bytes());",
@@ -788,13 +828,10 @@ fn gen_field_encode(fields: &[FieldDef], out: &mut String, prefix: &str, out_is_
             if !f.is_null_mem {
                 let access = format!("{}{}", prefix, f.rust_name);
                 let mask = if bw >= 8 { 0xFFu16 } else { (1u16 << bw) - 1 };
-                let cast = if f.in_mem_rust_type.as_deref() == Some("bool") || f.enum_type.is_none() && f.in_mem_rust_type.as_deref() == Some("bool") {
-                    format!("if {} {{ 1u8 }} else {{ 0u8 }}", access)
-                } else if f.enum_type.is_some() {
-                    format!("{} as u8", access)
-                } else if f.in_mem_rust_type.as_deref() == Some("bool") {
+                let cast = if f.in_mem_rust_type.as_deref() == Some("bool") {
                     format!("if {} {{ 1u8 }} else {{ 0u8 }}", access)
                 } else {
+                    // Enum and integer in-memory types both encode as `as u8`.
                     format!("{} as u8", access)
                 };
                 writeln!(out, "        {{ let v = ({}) & {}u8; bit_acc |= v << bit_pos; bit_pos += {}; if bit_pos >= 8 {{ out.push(bit_acc); bit_acc = 0; bit_pos = 0; }} }}", cast, mask as u8, bw).ok();

@@ -20,8 +20,47 @@ use sim_core::platform::{
     MavLinkSourceConfig, PlatformSourceConfig, Stanag4586SourceConfig, StaticSourceConfig,
 };
 
+/// Top-level runtime mode for the binary.
+///
+/// `Bridge` is the historical behaviour: bind the CIGI UDP port, run scene-
+/// generator detection, and bridge Trillium ↔ CIGI.
+///
+/// `Simulator` runs only the local `GimbalSimulator` and emits Trillium
+/// telemetry over TCP — no CIGI bind, no SG polling, no UDP host task. Useful
+/// for bring-up against Trillium clients without standing up the visualisation
+/// stack and for running multiple gimbal sims on one host without port
+/// collisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMode {
+    Bridge,
+    Simulator,
+}
+
+impl RuntimeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeMode::Bridge => "bridge",
+            RuntimeMode::Simulator => "simulator",
+        }
+    }
+
+    /// Case-insensitive parse. Returns `None` for unknown values; callers
+    /// decide whether to warn and fall back to a default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bridge" => Some(RuntimeMode::Bridge),
+            "simulator" | "sim" => Some(RuntimeMode::Simulator),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    // ── Runtime ──────────────────────────────────────────
+    /// Bridge (default) or Simulator mode. See [`RuntimeMode`].
+    pub runtime_mode: RuntimeMode,
+
     // ── Network ──────────────────────────────────────────
     /// TCP port to accept Trillium/Orion connections (default 8008).
     pub orion_listen_port: u16,
@@ -149,6 +188,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            runtime_mode: RuntimeMode::Bridge,
             orion_listen_port: 8008,
             scene_generator_ip: "127.0.0.1".to_string(),
             scene_generator_cigi_port: 8100,
@@ -210,6 +250,7 @@ impl Default for Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigFile {
+    runtime: RuntimeSection,
     network: NetworkSection,
     platform_source: PlatformSourceSection,
     kinematics: KinematicsSection,
@@ -223,6 +264,13 @@ struct ConfigFile {
     track: TrackSection,
     laser: LaserSection,
     coupling: CouplingSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RuntimeSection {
+    /// `"bridge"` (default) | `"simulator"`. See [`RuntimeMode`].
+    mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -369,6 +417,16 @@ impl From<ConfigFile> for Config {
     fn from(f: ConfigFile) -> Self {
         let mut cfg = Config::default();
 
+        // ── Runtime ──
+        if let Some(mode) = f.runtime.mode {
+            match RuntimeMode::parse(&mode) {
+                Some(m) => cfg.runtime_mode = m,
+                None => eprintln!(
+                    "[config] unknown runtime.mode {mode:?} — defaulting to bridge"
+                ),
+            }
+        }
+
         // ── Network ──
         if let Some(v) = f.network.orion_listen_port { cfg.orion_listen_port = v; }
         if let Some(v) = f.network.scene_generator_ip { cfg.scene_generator_ip = v; }
@@ -507,6 +565,13 @@ impl Config {
         }
     }
 
+    /// Override the runtime mode (used by `main` to apply the CLI flag on
+    /// top of the parsed config).
+    pub fn with_runtime_mode(mut self, mode: RuntimeMode) -> Self {
+        self.runtime_mode = mode;
+        self
+    }
+
     /// Returns `true` when pan rotation is continuous (no hard stop).
     ///
     /// Triggered by `pan_limit_deg >= 360` in the config file.
@@ -527,6 +592,10 @@ impl Config {
 
     /// Look up `(hfov_deg, vfov_deg)` wide-end FOV for a camera index.
     /// Falls back to camera 0 for out-of-range indices.
+    ///
+    /// Returns **degrees** because `camera_table` is stored in degrees for
+    /// configuration ergonomics. `fov_at_zoom_for_camera` is the radian-valued
+    /// counterpart used by the simulator and should be preferred on hot paths.
     pub fn camera_fov(&self, index: i8) -> (f32, f32) {
         let i = index.max(0) as usize;
         let entry = if i < self.camera_table.len() {
@@ -569,6 +638,75 @@ mod tests {
         p.push(format!("cigi_trillium_cfg_test_{}.toml", name));
         fs::write(&p, content).expect("write temp config");
         p.to_string_lossy().into_owned()
+    }
+
+    // ── Runtime mode ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_runtime_section_simulator() {
+        let content = "[runtime]\nmode = \"simulator\"\n";
+        let path = write_temp("runtime_sim", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Simulator);
+    }
+
+    #[test]
+    fn load_runtime_section_bridge_explicit() {
+        let content = "[runtime]\nmode = \"bridge\"\n";
+        let path = write_temp("runtime_bridge", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Bridge);
+    }
+
+    #[test]
+    fn load_missing_runtime_defaults_to_bridge() {
+        let content = "[network]\norion_listen_port = 9090\n";
+        let path = write_temp("runtime_missing", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Bridge);
+    }
+
+    #[test]
+    fn load_runtime_unknown_mode_falls_back_to_bridge() {
+        // Unknown mode strings are accepted at the TOML layer (the field is
+        // an Option<String>) but produce a stderr warning and leave the
+        // default in place.
+        let content = "[runtime]\nmode = \"zorp\"\n";
+        let path = write_temp("runtime_unknown", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Bridge);
+    }
+
+    #[test]
+    fn load_runtime_denies_unknown_fields() {
+        // A typo inside the [runtime] section must fail parsing (and fall
+        // through to a full default), thanks to deny_unknown_fields.
+        let content = "[runtime]\nmodes = \"simulator\"\n";
+        let path = write_temp("runtime_typo", content);
+        let cfg = Config::load(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Bridge);
+    }
+
+    #[test]
+    fn with_runtime_mode_overrides() {
+        let cfg = Config::default().with_runtime_mode(RuntimeMode::Simulator);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Simulator);
+        let cfg2 = cfg.with_runtime_mode(RuntimeMode::Bridge);
+        assert_eq!(cfg2.runtime_mode, RuntimeMode::Bridge);
+    }
+
+    #[test]
+    fn runtime_mode_parse_case_insensitive() {
+        assert_eq!(RuntimeMode::parse("SIMULATOR"), Some(RuntimeMode::Simulator));
+        assert_eq!(RuntimeMode::parse("Bridge"), Some(RuntimeMode::Bridge));
+        assert_eq!(RuntimeMode::parse("sim"), Some(RuntimeMode::Simulator));
+        assert_eq!(RuntimeMode::parse(" bridge "), Some(RuntimeMode::Bridge));
+        assert_eq!(RuntimeMode::parse("zorp"), None);
     }
 
     // ── Config::load ─────────────────────────────────────────────────────────

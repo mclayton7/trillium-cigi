@@ -113,6 +113,10 @@ pub fn orion_cmd_to_sensor_control(
     };
 
     SensorControl {
+        // Three cameras (0=EO wide, 1=EO narrow, 2=IR) populate `camera_table`.
+        // Out-of-range inputs are clamped rather than rejected to keep the
+        // wire packet well-formed; an upstream validation layer should catch
+        // bad indices before they reach this conversion.
         sensor_id: camera_index.clamp(0, 2) as u8,
         view_id: 0,
         sensor_state,

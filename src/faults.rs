@@ -101,17 +101,12 @@ impl FaultState {
     pub fn inject_laser_fault(&mut self) { self.laser_fault = true; }
     pub fn clear_laser_fault(&mut self)  { self.laser_fault = false; }
 
-    pub fn clear_all(&mut self)          {
-        self.gps_loss = false;
-        self.motor_fault = false;
-        self.imu_dropout = false;
-        self.thermal_warning = false;
-        self.degraded_gps = false;
-        self.gps_noise_std = 0.0;
-        self.encoder_fault = false;
-        self.frozen_pan = 0.0;
-        self.frozen_tilt = 0.0;
-        self.laser_fault = false;
+    pub fn clear_all(&mut self) {
+        // Preserve `uptime_secs` (it is not a fault flag — it tracks elapsed
+        // time for the temperature drift model). Every other field is reset.
+        let uptime = self.uptime_secs;
+        *self = FaultState::default();
+        self.uptime_secs = uptime;
     }
 
     // ── Packet builders ──────────────────────────────────────────
@@ -171,9 +166,14 @@ impl FaultState {
             });
         }
         if self.gps_loss {
-            // NOTE: The Orion protocol XML defines no GPS-specific fault type.
-            // FaultTypeNone + FaultLevelWarning is a convention for GPS loss.
-            // Update if a GPS fault type is added to OrionPublicProtocol.xml.
+            // The Orion protocol XML enumerates only PanAxis / TiltAxis /
+            // PayloadGyros for `OrionFaultComponent` and only None /
+            // ClevisResetCommanded / InvalidGyroCalibration /
+            // VelocityLimitExceeded / AccelerationLimitExceeded for
+            // `OrionFaultType`. There is no GPS or INS variant for either, so
+            // `FaultTypeNone + FaultLevelWarning + FaultComponentPayloadGyros`
+            // is the closest available encoding. Switch to a dedicated variant
+            // if the XML ever grows GPS-specific values.
             pkts.push(OrionFaultPacket {
                 type_: OrionFaultType::FaultTypeNone,
                 level: OrionFaultLevel::FaultLevelWarning,
@@ -330,6 +330,8 @@ mod tests {
         fs.inject_thermal();
         fs.inject_degraded_gps(0.01);
         fs.inject_encoder_fault(1.0, 2.0);
+        fs.inject_laser_fault();
+        fs.tick(1.5);
         fs.clear_all();
         assert!(!fs.gps_loss);
         assert!(!fs.motor_fault);
@@ -340,6 +342,10 @@ mod tests {
         assert!(!fs.encoder_fault);
         assert_eq!(fs.frozen_pan, 0.0);
         assert_eq!(fs.frozen_tilt, 0.0);
+        assert!(!fs.laser_fault);
+        // uptime_secs is intentionally preserved across clear_all so the
+        // temperature drift model continues monotonically.
+        assert!((fs.uptime_secs - 1.5).abs() < 1e-6);
     }
 
     // ── build_fault_packets ───────────────────────────────────────────────
