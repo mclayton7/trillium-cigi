@@ -8,6 +8,8 @@
 //     → encodes and writes back over TCP
 // On disconnect, waits for the next incoming connection.
 
+use std::io;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -20,21 +22,24 @@ use crate::orion::{GeolocateTelemetryCorePacket, OrionCmdPacket};
 /// Guards against a misbehaving client filling memory with unparseable data.
 const MAX_RX_BUF: usize = 65_536;
 
-/// Run the Trillium TCP server forever.
+/// Bind the Trillium listener up front so a port-in-use failure is reported
+/// to the caller before any background task is spawned.
+pub async fn bind(cfg: &Config) -> io::Result<TcpListener> {
+    let addr = format!("0.0.0.0:{}", cfg.orion_listen_port);
+    let listener = TcpListener::bind(&addr).await?;
+    println!("[trillium] TCP server listening on {addr}");
+    Ok(listener)
+}
+
+/// Service connections on an already-bound listener forever.
 ///
 /// - `orion_cmd_tx`: decoded `OrionCmdPacket`s are sent here.
 /// - `orion_telem_rx`: `GeolocateTelemetryCorePacket`s received here are forwarded to the client.
-pub async fn run(
-    cfg: Config,
+pub async fn serve(
+    listener: TcpListener,
     orion_cmd_tx: mpsc::Sender<OrionCmdPacket>,
     mut orion_telem_rx: mpsc::Receiver<GeolocateTelemetryCorePacket>,
 ) {
-    let addr = format!("0.0.0.0:{}", cfg.orion_listen_port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| panic!("[trillium] failed to bind {addr}: {e}"));
-    println!("[trillium] TCP server listening on {addr}");
-
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {

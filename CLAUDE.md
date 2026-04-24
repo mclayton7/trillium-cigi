@@ -2,9 +2,11 @@
 
 ```bash
 cargo build --release      # also runs build.rs codegen
-cargo test                 # ~125 tests across cigi, orion, simulator, convert, config, faults
+cargo test                 # ~135 unit tests + ~4 integration tests in tests/runtime_mode.rs
 cargo run                  # uses ./config.toml if present; built-in defaults otherwise
 cargo run -- --diag        # enable 1 Hz diagnostics log
+cargo run -- --simulator   # force pure-simulator mode (no CIGI bind), regardless of config
+cargo run -- --bridge      # force bridge mode, regardless of config
 cargo test <test_name>     # run a single test by name, e.g. cargo test slew_toward_target
 ```
 
@@ -19,11 +21,20 @@ cargo build && cat target/debug/build/cigi_trillium-*/out/orion_generated.rs | l
 
 ## Architecture
 
-**Role: Trillium→CIGI bridge.** Receives real Orion commands from a Trillium
-controller over TCP, converts them to CIGI, and drives a CIGI scene generator.
-`GimbalSimulator` is kept as a fallback when the scene generator is unreachable.
+**Two runtime modes**, selected via `[runtime] mode = "bridge" | "simulator"` in
+`config.toml` (default `bridge`) or the `--bridge` / `--simulator` CLI flag (last-wins,
+overrides config):
 
-**Data flow:**
+- **Bridge** (historical role): receives Orion commands over TCP, converts to CIGI,
+  drives a CIGI scene generator over UDP, and forwards `SensorResponse` telemetry back
+  to the Trillium controller. `GimbalSimulator` is the fallback when no `StartOfFrame`
+  arrives within 2 s.
+- **Simulator** (pure gimbal sim): no CIGI bind, no scene-generator polling, no
+  `cigi::host` task. Drives `GimbalSimulator` every tick and emits synthetic Trillium
+  telemetry at 10 Hz. Useful for Trillium-client bring-up without UE5 and for running
+  multiple gimbal sims on one host without CIGI port collisions.
+
+**Data flow (bridge mode):**
 ```
 Trillium Controller ↕ TCP (Orion big-endian) :orion_listen_port
 [This App]
@@ -31,7 +42,9 @@ Trillium Controller ↕ TCP (Orion big-endian) :orion_listen_port
 CIGI Scene Generator (IG)
 ```
 
-- `src/main.rs` — 50 Hz Tokio loop; 4 mpsc channels + 1 watch (platform); scene-gen detection (2 s SOF timeout); simulator fallback
+**Data flow (simulator mode):** Trillium TCP only — CIGI half is not spawned.
+
+- `src/main.rs` — 50 Hz Tokio loop; mpsc + watch channels; scene-gen detection (bridge mode, 2 s SOF timeout); CIGI channels are `Option<_>` and only created in bridge mode
 - `src/simulator/mod.rs` — GimbalSimulator: all physics, modes, telemetry
 - `src/config.rs` — `Config` struct + serde/toml parser (sectioned TOML, `deny_unknown_fields`)
 - `src/faults.rs` — FaultState, OrionDiagnosticsPacket builder
@@ -53,13 +66,15 @@ Geo (WGS84 / ECEF / NED / ray-cast), CIGI wire structs + build helpers, and plat
 
 **Config loading:** `config.toml` in the working directory is loaded at startup (sectioned TOML, parsed via `serde` + the `toml` crate). Missing file → built-in `Config::default()`. Every section uses `deny_unknown_fields`, so a misspelled key causes the whole file to fail parsing and fall back to defaults — check stderr for `[config] failed to parse`. Add new knobs by extending `Config`, the matching `Option<T>` on `ConfigFile`, and the copy-across in `From<ConfigFile> for Config`.
 
+**Runtime mode selection:** `[runtime] mode = "bridge" | "simulator"` in TOML, plus `RuntimeMode` enum in `src/config.rs`. CLI flags `--simulator` / `--bridge` override the config (last occurrence wins on duplicates). Unknown mode strings log to stderr and keep the default. `Config::with_runtime_mode(mode)` is a builder helper used by `main` to apply the CLI override on top of the parsed config.
+
 ## Gotchas
 
 **`GimbalSimulator::tick()` takes `f64`** (not `f32`). Use a `f64` constant for DT.
 
 **`GeolocateTelemetryCorePacket` field types:** `pan/tilt: f32` (radians), `pos_lat/pos_lon: f64` (radians), `pos_alt: f64` (metres). Infer from multiply-with-f64-constant pattern in existing code if unsure.
 
-**Scene generator detection:** app considers the scene generator "connected" if a `StartOfFrame` was received within the last 2 seconds. No SOF → simulator fallback activates automatically.
+**Scene generator detection:** app considers the scene generator "connected" if a `StartOfFrame` was received within the last 2 seconds. No SOF → simulator fallback activates automatically. **Only runs in bridge mode** — in simulator mode `cigi_resp_rx` is `None`, the SOF arm of the `tokio::select!` resolves to `pending()`, and `sg_connected` is hard-coded to `false` so the fallback arm runs every tick.
 
 **`SensorControl::decode` is test-only** (`#[cfg(test)]`). The bridge sends SensorControl (encode), never receives it.
 
@@ -74,7 +89,9 @@ Geo (WGS84 / ECEF / NED / ray-cast), CIGI wire structs + build helpers, and plat
 
 **CIGI gate_x_pos/gate_y_pos:** These fields carry the image-plane tracking gate centroid position (CIGI v3.3 spec-compliant), NOT gimbal pan/tilt angles. In track mode they equal `track_target[0]/[1]`; in all other modes they are 0.0 (bore-sighted). Pan/tilt are only available via the Orion TCP telemetry path.
 
-**Camera switch blackout:** `entity_lat/lon/alt` returns 0,0,0 for 200 ms (10 frames at the 50 Hz tick rate) after a camera switch. Tests must account for this.
+**Camera switch blackout:** `entity_lat/lon/alt` returns 0,0,0 for 200 ms (10 frames at the 50 Hz tick rate) after a camera switch. The same suppression also fires when `look_alt >= 1e6` (LOS missed the Earth) or when `faults.gps_loss` is active — without the GPS-loss gate the look-point would leak the true platform position even though `to_telemetry` had zeroed it. Tests must account for all three suppression triggers.
+
+**Camera switch preserves zoom:** `update_camera_fov` reads the current `zoom_level` and calls `fov_at_zoom_for_camera`, so a non-zero zoom held across a camera switch survives. Editing this path with the older `camera_fov(index)` helper (which returns degrees and ignores zoom) silently snaps FOV back to wide.
 
 **Continuous pan:** `pan_limit_deg = 360` enables unlimited rotation. Shortest-path algorithm is used; reported angle wraps to (−180°, 180°].
 
@@ -97,4 +114,10 @@ Geo (WGS84 / ECEF / NED / ray-cast), CIGI wire structs + build helpers, and plat
 
 **Thermal throttling:** When `thermal_warning` fault is active, effective `max_slew_rate` is halved.
 
-**GPS fault packet uses `FaultTypeNone`** — the Orion protocol XML defines no GPS-specific fault type. `FaultTypeNone + FaultLevelWarning` is the convention. Update if a GPS fault type is added to the XML.
+**GPS fault packet uses `FaultTypeNone`** — the Orion protocol XML defines no GPS-specific fault type or component. The packet uses `FaultTypeNone + FaultLevelWarning + FaultComponentPayloadGyros` (the closest available encoding). Switch to dedicated values if the XML grows GPS-specific variants.
+
+**`FaultState::clear_all` preserves `uptime_secs`** — that field tracks elapsed time for the temperature drift model and is not a fault flag. The implementation uses `*self = FaultState::default()` then restores `uptime_secs`, so future flag additions are reset automatically.
+
+**Codegen panics on unknown XML types** — `parse_in_mem` / `parse_enc` in `build.rs` panic when the XML uses an `inMemoryType` / `encodedType` not in the explicit match. `encodedType="float16"` is a known gap (used by `InsQuality` diagnostics) and emits a `cargo:warning`; the field is treated as null in the codec. Add IEEE half-precision encode/decode before relying on those packets on the wire.
+
+**TCP server bind is observed by main** — `trillium::server` exposes `bind` (returns `io::Result<TcpListener>`) and `serve` separately. `main` binds before spawning so a port-in-use failure exits cleanly instead of silently crashing the spawned task.

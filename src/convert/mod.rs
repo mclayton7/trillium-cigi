@@ -5,4 +5,4 @@ pub mod to_orion;
 ///
 /// Shared by `to_cigi` (encode) and `to_orion` (decode) so both sides of the
 /// normalisation always use the same scale factor.
-pub const MAX_SLEW_RATE: f32 = 1.047_198; // 60°/s
+pub const MAX_SLEW_RATE: f32 = std::f32::consts::FRAC_PI_3; // 60°/s = π/3

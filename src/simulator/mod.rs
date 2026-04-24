@@ -26,7 +26,7 @@ use sim_core::geo;
 
 #[allow(dead_code)]
 /// Default maximum slew rate (rad/s) = 60 °/s.  Matches Config::default().
-pub const MAX_SLEW_RATE: f32 = 1.047_198; // 60°/s in rad/s
+pub const MAX_SLEW_RATE: f32 = std::f32::consts::FRAC_PI_3; // 60°/s = π/3
 
 /// Camera switch blackout duration (frames at 50 Hz).
 const CAMERA_SWITCH_FRAMES: u8 = 10; // 200 ms
@@ -344,9 +344,13 @@ impl GimbalSimulator {
     }
 
     fn update_camera_fov(&mut self) {
-        let (h_deg, v_deg) = self.config.camera_fov(self.camera_index);
-        self.hfov = h_deg.to_radians();
-        self.vfov = v_deg.to_radians();
+        // Preserve the current zoom across camera switches — without this,
+        // any non-zero zoom held before a switch silently snaps back to wide.
+        let (h, v) = self
+            .config
+            .fov_at_zoom_for_camera(self.camera_index, self.zoom_level);
+        self.hfov = h;
+        self.vfov = v;
     }
 }
 
@@ -654,6 +658,11 @@ impl GimbalSimulator {
     /// Overwrite simulator state with a telemetry packet received from a real
     /// Orion gimbal (bridge mode).  Only observable fields are updated; command
     /// targets are left untouched so the CIGI host's commands remain in effect.
+    ///
+    /// Derived state (`pan_jittered`, `tilt_jittered`, `look_lat/lon/alt`,
+    /// `slant_range_m`) is recomputed from the new pose. Without that, any
+    /// telemetry assembled before the next `tick()` would carry the *previous*
+    /// simulator's jittered angles and look-point.
     pub fn apply_hardware_telemetry(&mut self, telem: &GeolocateTelemetryCorePacket) {
         self.pan = telem.pan;
         self.tilt = telem.tilt;
@@ -666,6 +675,41 @@ impl GimbalSimulator {
         self.vel_ned = telem.vel_ned;
         self.camera_index = telem.camera_index;
         self.system_time_ms = telem.system_time;
+
+        // The wire pan/tilt already include the real gimbal's jitter — there
+        // is no separate inertial-frame value to add jitter to. Treat the
+        // reported pose as the jittered value.
+        self.pan_jittered = self.pan;
+        self.tilt_jittered = self.tilt;
+        self.pan_jitter = 0.0;
+        self.tilt_jitter = 0.0;
+
+        // Recompute the look-point and slant range from the new pose so that
+        // subsequent `to_telemetry()` / `to_sensor_extended_response()` calls
+        // before the next `tick()` aren't reporting the previous look-point.
+        if let Some([ll, lo, la]) = geo::compute_look_point(
+            self.pos_lat, self.pos_lon, self.pos_alt,
+            self.platform_yaw,
+            self.platform_roll, self.platform_pitch,
+            self.config.stabilization_quality,
+            self.pan_jittered, self.tilt_jittered,
+            self.config.refraction_enabled,
+            self.config.terrain_elevation_m,
+            &self.config.gimbal_mount,
+        ) {
+            self.look_lat = ll;
+            self.look_lon = lo;
+            self.look_alt = la;
+            let [px, py, pz] =
+                geo::geodetic_to_ecef(self.pos_lat, self.pos_lon, self.pos_alt);
+            let [lx, ly, lz] = geo::geodetic_to_ecef(ll, lo, la);
+            let dx = lx - px;
+            let dy = ly - py;
+            let dz = lz - pz;
+            self.slant_range_m = (dx * dx + dy * dy + dz * dz).sqrt();
+        } else {
+            self.slant_range_m = 0.0;
+        }
     }
 }
 
@@ -815,16 +859,22 @@ impl GimbalSimulator {
         );
 
         // Override entity position with computed look-point.
-        // During camera switch blackout, report NaN-equivalent (0,0,0).
-        if self.camera_switch_remaining == 0 && self.look_alt < 1e6 {
+        // Zero out (0,0,0) during camera switch blackout, when the look-point
+        // ray missed the Earth, or when GPS is lost (the look-point is derived
+        // from the platform position which `to_telemetry` already zeroed —
+        // leaking the cached `self.look_*` here would defeat that gate).
+        let suppress = self.camera_switch_remaining > 0
+            || self.look_alt >= 1e6
+            || self.faults.gps_loss;
+        if suppress {
+            resp.entity_lat = 0.0;
+            resp.entity_lon = 0.0;
+            resp.entity_alt = 0.0;
+        } else {
             let deg = 180.0 / std::f64::consts::PI;
             resp.entity_lat = self.look_lat * deg;
             resp.entity_lon = self.look_lon * deg;
             resp.entity_alt = self.look_alt;
-        } else {
-            resp.entity_lat = 0.0;
-            resp.entity_lon = 0.0;
-            resp.entity_alt = 0.0;
         }
 
         // Gate size derived from FOV and configured tracking gate angular size.
@@ -1390,6 +1440,120 @@ mod tests {
         assert_eq!(telem.entity_lat, 0.0, "GPS loss: entity_lat should be 0");
         assert_eq!(telem.entity_lon, 0.0, "GPS loss: entity_lon should be 0");
         assert_eq!(telem.entity_alt, 0.0, "GPS loss: entity_alt should be 0");
+    }
+
+    #[test]
+    fn gps_loss_zeroes_look_point_in_steady_state() {
+        // Once `tick()` has populated `look_lat/lon/alt` with a real ray-cast
+        // hit, injecting GPS loss must still zero `entity_*` in the SER —
+        // otherwise the look-point leaks the true platform position.
+        let mut cfg = Config::default();
+        cfg.jitter_amplitude = 0.0;
+        cfg.noise_floor = 0.0;
+        let mut sim = GimbalSimulator::with_config(cfg);
+        sim.pos_lat = 0.5;
+        sim.pos_lon = -1.5;
+        sim.pos_alt = 1000.0;
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_tilt = 0.8; // look down so the LOS hits the ground
+
+        for _ in 0..30 {
+            sim.tick(0.02);
+        }
+        // Sanity check: clean SER reports a non-zero look-point.
+        let clean = sim.to_sensor_extended_response();
+        assert!(
+            clean.entity_lat != 0.0 || clean.entity_lon != 0.0 || clean.entity_alt != 0.0,
+            "look-point should be populated before GPS loss"
+        );
+
+        sim.faults.inject_gps_loss();
+        let faulted = sim.to_sensor_extended_response();
+        assert_eq!(faulted.entity_lat, 0.0);
+        assert_eq!(faulted.entity_lon, 0.0);
+        assert_eq!(faulted.entity_alt, 0.0);
+    }
+
+    // ── apply_hardware_telemetry refresh ─────────────────────────────────
+
+    #[test]
+    fn apply_hardware_telemetry_refreshes_look_point() {
+        // Without the post-apply recompute, telemetry assembled before the
+        // next `tick()` would carry the previous simulator's look-point.
+        let mut sim = GimbalSimulator::default();
+        sim.pos_lat = 0.5;
+        sim.pos_lon = -1.5;
+        sim.pos_alt = 1000.0;
+        sim.mode = OrionMode::OrionModePosition;
+        sim.target_tilt = 0.8;
+        for _ in 0..30 {
+            sim.tick(0.02);
+        }
+        let prev_look = (sim.look_lat, sim.look_lon, sim.look_alt);
+
+        // Build a telemetry packet that points the gimbal at a different
+        // pan/tilt and apply it. Without the refresh, look_* would be stale.
+        let mut hw = sim.to_telemetry();
+        hw.pan = 0.5; // change yaw enough to move the look-point
+        hw.tilt = 0.6;
+        sim.apply_hardware_telemetry(&hw);
+
+        let new_look = (sim.look_lat, sim.look_lon, sim.look_alt);
+        assert!(
+            (new_look.0 - prev_look.0).abs() > 1e-6
+                || (new_look.1 - prev_look.1).abs() > 1e-6,
+            "look-point not refreshed after apply_hardware_telemetry: \
+             prev={prev_look:?} new={new_look:?}"
+        );
+    }
+
+    // ── Camera switch preserves zoom ─────────────────────────────────────
+
+    #[test]
+    fn camera_switch_preserves_zoom() {
+        // A camera switch coincident with the same zoom level (Position mode)
+        // must yield FOV scaled to the new camera's narrow end, not its wide
+        // end — i.e. `update_camera_fov` honours the in-flight `zoom_level`
+        // that `apply_zoom` has just set.
+        let mut sim = GimbalSimulator::default();
+        // Start on cam 0 at wide.
+        sim.camera_index = 0;
+        sim.zoom_level = 0.0;
+
+        // Switch to cam 2 (IR) at full narrow zoom in a single command.
+        let sc = sim_core::cigi::messages::SensorControl {
+            sensor_state: 1, // Position
+            sensor_id: 2,
+            gain: 0.5,
+            level: 0.5,
+            ac_coupling: 1.0, // narrow zoom
+            ..Default::default()
+        };
+        sim.apply_sensor_control(&sc);
+
+        let (expected_h, expected_v) =
+            sim.config.fov_at_zoom_for_camera(2, 1.0);
+        assert!(
+            (sim.hfov - expected_h).abs() < 1e-6,
+            "hfov after switch={} expected (cam2 narrow)={}",
+            sim.hfov,
+            expected_h
+        );
+        assert!(
+            (sim.vfov - expected_v).abs() < 1e-6,
+            "vfov after switch={} expected={}",
+            sim.vfov,
+            expected_v
+        );
+        // And it must NOT have snapped back to cam 2's wide-end FOV — that
+        // was the pre-fix behaviour.
+        let (cam2_wide_h, _) = sim.config.fov_at_zoom_for_camera(2, 0.0);
+        assert!(
+            (sim.hfov - cam2_wide_h).abs() > 1e-3,
+            "hfov={} unexpectedly matches cam2 wide ({}); zoom was lost",
+            sim.hfov,
+            cam2_wide_h
+        );
     }
 
     // ── Continuous pan shortest path ──────────────────────────────────────

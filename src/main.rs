@@ -7,7 +7,7 @@ mod trillium;
 
 use std::time::{Duration, Instant};
 
-use config::Config;
+use config::{Config, RuntimeMode};
 use simulator::GimbalSimulator;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -43,6 +43,17 @@ async fn main() {
     // ── CLI args ──────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let diag_enabled = args.iter().any(|a| a == "--diag");
+    // --simulator / --bridge override [runtime] mode in the config file.
+    // Last-wins on duplicates.
+    let cli_mode_override = args.iter().rev().find_map(|a| match a.as_str() {
+        "--simulator" => Some(RuntimeMode::Simulator),
+        "--bridge" => Some(RuntimeMode::Bridge),
+        _ => None,
+    });
+    let cfg = match cli_mode_override {
+        Some(m) => cfg.with_runtime_mode(m),
+        None => cfg,
+    };
 
     // ── Platform state — watch channel seeded from config ────────────────
     let platform_source = cfg.platform_source_config();
@@ -56,18 +67,49 @@ async fn main() {
     // ── Channels ──────────────────────────────────────────────────────────
     let (orion_cmd_tx, mut orion_cmd_rx) = mpsc::channel::<OrionCmdPacket>(32);
     let (orion_telem_tx, orion_telem_rx) = mpsc::channel::<GeolocateTelemetryCorePacket>(4);
-    let (cigi_send_tx, cigi_send_rx) = mpsc::channel::<cigi::host::CigiDatagram>(8);
-    let (cigi_resp_tx, mut cigi_resp_rx) = mpsc::channel::<CigiResponse>(8);
 
-    // ── Spawn Trillium TCP server task ────────────────────────────────────
-    tokio::spawn(trillium::server::run(
-        cfg.clone(),
+    // ── Bind Trillium TCP listener up front so port-in-use fails fast ─────
+    // Previously the server task was spawned and bound asynchronously, so a
+    // bind failure crashed only the spawned task — main kept ticking with no
+    // Trillium connectivity. Bind here and exit cleanly on failure.
+    let trillium_listener = match trillium::server::bind(&cfg).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "[main] failed to bind Trillium listener on port {}: {e}",
+                cfg.orion_listen_port
+            );
+            std::process::exit(1);
+        }
+    };
+    tokio::spawn(trillium::server::serve(
+        trillium_listener,
         orion_cmd_tx,
         orion_telem_rx,
     ));
 
-    // ── Spawn CIGI host UDP I/O task ──────────────────────────────────────
-    tokio::spawn(cigi::host::run(cfg.cigi_listen_port, cfg.scene_generator_ip.clone(), cfg.scene_generator_cigi_port, cigi_send_rx, cigi_resp_tx));
+    // ── CIGI host UDP I/O — bridge mode only ──────────────────────────────
+    // In simulator mode we skip the bind and the spawn entirely so the UDP
+    // port is free (multiple sims can run on one host) and there is no SG
+    // detection overhead.
+    let (cigi_send_tx, mut cigi_resp_rx): (
+        Option<mpsc::Sender<cigi::host::CigiDatagram>>,
+        Option<mpsc::Receiver<CigiResponse>>,
+    ) = match cfg.runtime_mode {
+        RuntimeMode::Bridge => {
+            let (send_tx, send_rx) = mpsc::channel::<cigi::host::CigiDatagram>(8);
+            let (resp_tx, resp_rx) = mpsc::channel::<CigiResponse>(8);
+            tokio::spawn(cigi::host::run(
+                cfg.cigi_listen_port,
+                cfg.scene_generator_ip.clone(),
+                cfg.scene_generator_cigi_port,
+                send_rx,
+                resp_tx,
+            ));
+            (Some(send_tx), Some(resp_rx))
+        }
+        RuntimeMode::Simulator => (None, None),
+    };
 
     // ── Event loop ────────────────────────────────────────────────────────
     let mut tick = tokio::time::interval(Duration::from_secs_f64(DT));
@@ -84,13 +126,19 @@ async fn main() {
     // Orion client doesn't see interleaved lookpoints from two sources.
     let mut last_sensor_response: Option<Instant> = None;
 
-    println!(
-        "CIGI Trillium Bridge — Trillium TCP :{} | CIGI UDP :{} → {}:{}",
-        cfg.orion_listen_port,
-        cfg.cigi_listen_port,
-        cfg.scene_generator_ip,
-        cfg.scene_generator_cigi_port,
-    );
+    match cfg.runtime_mode {
+        RuntimeMode::Bridge => println!(
+            "CIGI Trillium Bridge — mode = bridge — Trillium TCP :{} | CIGI UDP :{} → {}:{}",
+            cfg.orion_listen_port,
+            cfg.cigi_listen_port,
+            cfg.scene_generator_ip,
+            cfg.scene_generator_cigi_port,
+        ),
+        RuntimeMode::Simulator => println!(
+            "CIGI Trillium Bridge — mode = simulator — Trillium TCP :{} (CIGI disabled)",
+            cfg.orion_listen_port,
+        ),
+    }
     if diag_enabled {
         println!("[diag] diagnostics enabled at 1 Hz");
     }
@@ -102,9 +150,13 @@ async fn main() {
             // ── 50 Hz tick ────────────────────────────────────────────────
             _ = tick.tick() => {
                 frame_ctr = frame_ctr.wrapping_add(1);
-                let sg_connected = last_sof
-                    .map(|t| t.elapsed() < SG_TIMEOUT)
-                    .unwrap_or(false);
+                // In simulator mode, cigi_resp_rx is None and last_sof can
+                // never advance — `sg_connected` is always false, which
+                // forces the simulator-fallback arm to run every tick.
+                let sg_connected = matches!(cfg.runtime_mode, RuntimeMode::Bridge)
+                    && last_sof
+                        .map(|t| t.elapsed() < SG_TIMEOUT)
+                        .unwrap_or(false);
 
                 if sg_connected {
                     // ── Scene generator path ─────────────────────────────
@@ -154,7 +206,9 @@ async fn main() {
                         WIRE_PRESET_COUNT,
                     );
                     let datagram = build_datagram(&ig, &ec, Some(&vc), Some(&sc_wire));
-                    cigi_send_tx.try_send(datagram).ok();
+                    if let Some(tx) = cigi_send_tx.as_ref() {
+                        tx.try_send(datagram).ok();
+                    }
 
                     // Synthetic telemetry acts as a keepalive only when the
                     // scene generator isn't currently producing SensorResponse
@@ -170,7 +224,7 @@ async fn main() {
                         orion_telem_tx.try_send(telem).ok();
                     }
                 } else {
-                    // ── Simulator fallback ───────────────────────────────
+                    // ── Simulator fallback (and pure-simulator mode) ─────
                     if let Some(ref cmd) = last_cmd {
                         let sc = orion_cmd_to_sensor_control(cmd, sim.camera_index, sim.zoom_level);
                         sim.apply_sensor_control(&sc);
@@ -197,8 +251,15 @@ async fn main() {
                 last_cmd = Some(cmd);
             }
 
-            // ── CIGI response from scene generator ───────────────────────
-            Some(resp) = cigi_resp_rx.recv() => {
+            // ── CIGI response from scene generator (bridge mode only) ────
+            // In simulator mode `cigi_resp_rx` is None; the inner future
+            // resolves to `pending()` and never fires.
+            Some(resp) = async {
+                match cigi_resp_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match resp {
                     CigiResponse::StartOfFrame(sof) => {
                         last_sof = Some(Instant::now());
